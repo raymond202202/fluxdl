@@ -53,12 +53,15 @@ python3 fluxdl.py URL -o dir --expect-sha256 <官方sha256>
 
 # 带鉴权头
 python3 fluxdl.py URL --referer https://site.com --cookie "k=v"
+
+# 诊断模式：文件系统不支持空洞检测（tmpfs/网络盘）时会提示降级
+python3 fluxdl.py URL -v
 ```
 
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v      # 10 个用例
+python3 -m unittest discover -s tests -v      # 16 个用例
 python3 scripts/check_stdlib_only.py          # 零依赖校验
 ```
 
@@ -71,6 +74,8 @@ CI 在 Python 3.10 / 3.12 / 3.13 上运行同一套测试（见 `.github/workflo
 | **大文件加速**（python.org 40MB，限速 12.6Mbps） | 25.7s → **1.8s（14.2×）**，`-c 1` 仍 25.7s |
 | **面板队列推进** | 5 任务（上限 3）全部完成，无卡死 |
 | **面板内容校验** | 坏文件报「校验未通过」，不再谎报完成 |
+| **小文件** | < 8MiB 跳过自适应测速，省掉 1.5s 空转 |
+| **面板实时性** | SSE 推送（0.7s），无 SSE 时自动退回 800ms 轮询 |
 
 ## 已知坑（血泪教训）
 

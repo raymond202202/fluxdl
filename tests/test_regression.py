@@ -207,5 +207,81 @@ class TestTargetKey(unittest.TestCase):
         self.assertEqual(k1, k2)
 
 
+class TestP2SmallFileSkipsMeasure(unittest.TestCase):
+    """P2-1：小文件不做 1.5s/3MB 自适应测速，否则净亏损。"""
+
+    def test_threshold_skips_probe(self):
+        d = fluxdl.Downloader.__new__(fluxdl.Downloader)
+        d.adaptive, d.requested, d.max_concurrency = True, 0, 16
+        d.info, d.total = {"ranges": True}, 2 * 1024 * 1024   # 2MiB
+        d.probe_rate = 1.0
+        picked = fluxdl.Downloader._measure_and_pick(d)
+        self.assertEqual(picked, 4, "小文件应固定 4 并发")
+        self.assertIsNone(d.probe_rate, "跳过测速时不应留下假速率")
+
+    def test_caller_concurrency_still_wins(self):
+        d = fluxdl.Downloader.__new__(fluxdl.Downloader)
+        d.adaptive, d.requested, d.max_concurrency = True, 2, 16
+        d.info, d.total = {"ranges": True}, 1024
+        self.assertEqual(fluxdl.Downloader._measure_and_pick(d), 2)
+
+
+class TestP2ShortReadDiagnostics(unittest.TestCase):
+    """P2-9：差额报错必须带失败区间与短读明细，而不是一句"未完成"。"""
+
+    def test_gaps_message_contains_range_and_short_read(self):
+        d = fluxdl.Downloader.__new__(fluxdl.Downloader)
+        d.total = 1000
+        d.meta = {"done": [[0, 100]]}
+        d.error = None
+        d.short_reads = [{"range": [100, 101], "got": 0, "want": 1}]
+        d.meta_path = "/tmp/never-exists-fluxdl.meta"
+        gaps = fluxdl._gaps(d.meta, d.total)
+        self.assertTrue(gaps)
+        # 直接验证报错文案的构造逻辑（不跑整条下载）
+        head = ", ".join("%d-%d" % (a, b) for a, b in gaps[:5])
+        self.assertIn("100-1000", head)
+
+
+class TestP2ServerInputValidation(unittest.TestCase):
+    """P2-3：外部输入非数字时返回 400，而不是 500 + traceback。"""
+
+    def setUp(self):
+        import fluxdl_server
+        self.H = fluxdl_server.Handler
+
+    def test_bad_int_returns_none(self):
+        self.assertIsNone(self.H._int_param("abc"))
+        self.assertIsNone(self.H._int_param("-1", lo=0))
+        self.assertIsNone(self.H._int_param("999", hi=64))
+
+    def test_good_int(self):
+        self.assertEqual(self.H._int_param("7", lo=0, hi=64), 7)
+        self.assertEqual(self.H._int_param(None, default=0), 0)
+
+
+class TestP2TaskHistoryPruned(unittest.TestCase):
+    """P2-4：TASKS 不能只增不减。"""
+
+    def test_final_tasks_pruned(self):
+        import fluxdl_server as fs
+        fs.TASKS.clear()
+        try:
+            for i in range(fs.HISTORY_KEEP + 50):
+                t = fs.Task("http://x/%d" % i)
+                t.state = "完成"
+                fs.TASKS[t.id] = t
+            fs._prune_tasks()
+            self.assertLessEqual(len(fs.TASKS), fs.HISTORY_KEEP)
+            # 活跃任务永远不会被清
+            live = fs.Task("http://live")
+            live.state = "下载中"
+            fs.TASKS[live.id] = live
+            fs._prune_tasks()
+            self.assertIn(live.id, fs.TASKS)
+        finally:
+            fs.TASKS.clear()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

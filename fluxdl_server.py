@@ -10,6 +10,7 @@ FluxDL 面板服务 — M2
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import secrets
@@ -83,7 +84,14 @@ class Task:
             else:
                 self.state = "完成"
                 self.message = str(info or "")
-                self.snapshot.update(percent=100.0, speed=0, eta=0)
+                # 小文件几十毫秒就下完，_on_prog 的 0.25s 节流可能一次都没触发，
+                # 于是 snapshot 里的 done/total 停在 0，前端就显示 "0 B / 未知"
+                # 而进度条是 100% —— 自相矛盾。完成时用 run() 的真实结果补齐。
+                size = res.get("size") or 0
+                with self._lock:
+                    self.snapshot.update(
+                        percent=100.0, speed=0, eta=0,
+                        done=size, total=size or self.snapshot.get("total", 0))
         except fluxdl.DownloadError as e:
             if self.cancelled_before_start or self.state == "已取消":
                 self.state = "已取消"
@@ -127,6 +135,28 @@ class Task:
 TASKS: dict[int, Task] = {}
 TASKS_LOCK = threading.Lock()
 MAX_ACTIVE = 3          # 同时下载任务数，避免把带宽切碎
+HISTORY_KEEP = 200      # 已完成/失败/取消的任务最多保留这么多条
+
+
+def _prune_tasks():
+    """P2-4：TASKS 原先只增不减。
+
+    面板跑一整天，几百个任务全留在字典里：每次 /api/list（前端 800ms 一次）
+    都要把全部任务 to_dict() 一遍并序列化，前端 render() 也要遍历一遍 ——
+    O(历史任务数) 的活儿每 0.8 秒干一次，越用越卡，且内存只涨不落。
+    这里只清终态任务，且永远保留最新的 HISTORY_KEEP 条，避免刚下的任务立刻消失。
+    必须在持有 TASKS_LOCK 时调用。
+    """
+    if len(TASKS) <= HISTORY_KEEP:
+        return
+    finals = [(tid, t) for tid, t in TASKS.items()
+              if t.state in ("完成", "失败", "已取消")]
+    overflow = len(TASKS) - HISTORY_KEEP
+    if overflow <= 0:
+        return
+    # 终态任务按 id 升序（旧的在前）淘汰
+    for tid, _ in sorted(finals, key=lambda kv: kv[0])[:overflow]:
+        TASKS.pop(tid, None)
 
 
 def _pick_queued():
@@ -190,6 +220,7 @@ def add_task(url, **kw):
                 return t, True
         t = Task(url, **kw)          # 实例化放进锁内，避免 Task._seq 并发撞 id
         TASKS[t.id] = t
+        _prune_tasks()               # P2-4：顺手淘汰过老的终态任务
     _pick_queued()
     return t, False
 
@@ -393,11 +424,35 @@ async function cancel(id){await fetch('/api/cancel?id='+id,{method:'POST',
 $('#add').onclick = add;
 $('#url').addEventListener('keydown',e=>{if(e.key==='Enter')add()});
 
-function tick(){
+// P2-5：原先这里在 800ms 轮询 /api/list，而服务端 /api/events 的 SSE 早就写好了
+// 却没人订阅 —— 等于死代码 + 白跑一份长连接实现。改成订阅 SSE：
+// 服务端 0.7s 推一次，网络上有新数据才动，空闲时不会像轮询那样每隔 800ms
+// 重建一次 HTTP 请求（每个请求一个线程，ThreadingHTTPServer 下尤其浪费）。
+// EventSource 不能自定义 header，所以 token 走 query（仅本机 127.0.0.1 监听）。
+let es = null, sseOk = false;
+
+function applyList(tasks){ render(tasks); }
+
+function pollFallback(){
+  // SSE 不可用（老浏览器 / 代理掐长连接）时退回轮询，功能不能没有。
   fetch('/api/list',{headers:{'X-Token':TOKEN}})
-    .then(r=>r.json()).then(d=>render(d.tasks)).catch(()=>{});
+    .then(r=>r.json()).then(d=>applyList(d.tasks)).catch(()=>{});
 }
-tick(); setInterval(tick, 800);
+
+function connectSSE(){
+  if(!window.EventSource){ setInterval(pollFallback, 800); return; }
+  es = new EventSource('/api/events?token=' + encodeURIComponent(TOKEN));
+  es.onopen = () => { sseOk = true; };
+  es.onmessage = ev => {
+    try { applyList(JSON.parse(ev.data).tasks); } catch(e) {}
+  };
+  es.onerror = () => {
+    // EventSource 自己会重连；连不上时用轮询兜底一次
+    sseOk = false;
+    pollFallback();
+  };
+}
+connectSSE();
 </script></body></html>"""
 
 
@@ -407,11 +462,42 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):      # 静音，避免刷屏
         pass
 
-    def _auth_ok(self):
-        if self.headers.get("X-Token") == TOKEN:
-            return True
-        # 页面本身允许匿名取（否则打不开），但只给静态 HTML
+    def _auth_ok(self, allow_query=False):
+        # P2-8：用 hmac.compare_digest 做常量时间比较。
+        # 原先的 == 会在第一个不同字节处提前返回，理论上可被计时侧信道逐字节猜出 token
+        # （本机单用户工具风险很低，但改一行的事没理由不做）。
+        got = self.headers.get("X-Token") or ""
+        if got:
+            return hmac.compare_digest(got, TOKEN)
+        # P2-5：EventSource 无法自定义请求头，SSE 只能用 query 传 token。
+        # 仅对本机 127.0.0.1 监听的用途放开；token 会进访问日志，
+        # 所以这里把该路径的日志静音（见 log_message）。
+        if allow_query:
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            got = (q.get("token") or [""])[0]
+            return hmac.compare_digest(got, TOKEN)
         return False
+
+    @staticmethod
+    def _int_param(raw, default=0, lo=None, hi=None):
+        """把外部输入安全地转成 int，失败返回 None（调用方回 400）。
+
+        P2-3：原先 int(q.get("id"))、int(data.get("concurrency")) 直接解析外部输入，
+        随手发一个 /api/cancel?id=abc 或 {"concurrency": "lots"} 就会抛 ValueError，
+        被 BaseHTTPRequestHandler 兜成 500 + 整段 traceback 写到控制台和响应里。
+        这既是信息泄露，也让"用户输错一个字符"看起来像服务器崩了。
+        """
+        if raw is None or raw == "":
+            return default
+        try:
+            v = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+        if lo is not None and v < lo:
+            return None
+        if hi is not None and v > hi:
+            return None
+        return v
 
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode()
@@ -435,13 +521,13 @@ class Handler(BaseHTTPRequestHandler):
         if u.path in ("/", "/index.html"):
             html = PAGE.replace("__TOKEN__", TOKEN).replace("__DIR__", DOWNLOAD_DIR)
             return self._html(html)
-        if not self._auth_ok():
-            return self._json({"error": "需要 token"}, 403)
-        if u.path == "/api/list":
-            with TASKS_LOCK:
-                ts = sorted(TASKS.values(), key=lambda t: -t.id)
-            return self._json({"tasks": [t.to_dict() for t in ts]})
+        # SSE 必须放在通用 token 校验之前：EventSource 无法自定义请求头，
+        # token 只能走 query，而通用 _auth_ok() 只认 X-Token 头 ——
+        # 若先走通用校验，带 ?token= 的 SSE 请求会被直接 403，
+        # 前端 onerror 又去轮询，SSE 就永远接不上（等于 P2-5 没修）。
         if u.path == "/api/events":           # SSE 实时推送
+            if not self._auth_ok(allow_query=True):
+                return self._json({"error": "需要 token"}, 403)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -457,6 +543,12 @@ class Handler(BaseHTTPRequestHandler):
                     time.sleep(0.7)
             except Exception:
                 return
+        if not self._auth_ok():
+            return self._json({"error": "需要 token"}, 403)
+        if u.path == "/api/list":
+            with TASKS_LOCK:
+                ts = sorted(TASKS.values(), key=lambda t: -t.id)
+            return self._json({"tasks": [t.to_dict() for t in ts]})
         return self._json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -465,7 +557,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "需要 token"}, 403)
         if u.path == "/api/cancel":
             q = urllib.parse.parse_qs(u.query)
-            tid = int(q.get("id", ["0"])[0])
+            tid = self._int_param((q.get("id") or ["0"])[0], default=0, lo=0)
+            if tid is None:
+                return self._json({"error": "id 必须是正整数"}, 400)
             with TASKS_LOCK:
                 t = TASKS.get(tid)
             if t:
@@ -477,13 +571,18 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(self.rfile.read(n) or b"{}")
             except Exception:
                 return self._json({"error": "非法 JSON"}, 400)
+            if not isinstance(data, dict):
+                return self._json({"error": "请求体必须是 JSON 对象"}, 400)
+            conc = self._int_param(data.get("concurrency"), default=0, lo=0, hi=64)
+            if conc is None:
+                return self._json({"error": "concurrency 必须是 0-64 的整数"}, 400)
             url = (data.get("url") or "").strip()
             if not url.lower().startswith(("http://", "https://")):
                 return self._json({"error": "只支持 http/https"}, 400)
             t, reused = add_task(url, referer=data.get("referer") or None,
                                  cookie=data.get("cookie") or None,
                                  name=data.get("name") or None,
-                                 concurrency=int(data.get("concurrency") or 0))
+                                 concurrency=conc)
             return self._json({"ok": True, "id": t.id, "reused": reused})
         return self._json({"error": "not found"}, 404)
 
