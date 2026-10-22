@@ -276,8 +276,9 @@ def _gaps(meta: dict, size: int) -> list[list[int]]:
 class Downloader:
     def __init__(self, url, out_dir=".", *, concurrency=0, ua=None, referer=None,
                  cookie=None, override_name=None, adaptive=True, on_progress=None,
-                 max_concurrency=16):
+                 max_concurrency=16, verbose=False):
         self.url, self.out_dir = url, out_dir
+        self.verbose = verbose
         self.requested = int(concurrency or 0)
         self.max_concurrency = max(1, min(int(max_concurrency), 16))
         self.concurrency = self.requested or 4
@@ -462,7 +463,17 @@ class Downloader:
                 self.finished = True
             else:
                 pool_ranges = [[a, b] for a, b in gaps]
-                n = max(1, min(self.concurrency, len(pool_ranges)))
+                # P0：线程数上界必须由「可切出的块数」决定，而不是「gap 区间个数」。
+                # 全新下载时 _gaps 只返回一个 [0, total]，len(pool_ranges)==1，
+                # 于是 n=1 —— 只起 1 个 worker 串行下完整个文件，而日志照样打印「并发=16」。
+                # 实测：-c 16 与 -c 1 同为 25.7s，全程 ESTAB=1、nlwp=1。
+                _gap_bytes = sum(b - a for a, b in pool_ranges)
+                _nblk = (_gap_bytes + CHUNK - 1) // CHUNK        # CHUNK = 256 KiB
+                n = max(1, min(self.concurrency, _nblk))
+                # 日志必须打印「实际生效值」——原缺陷藏这么久，就是因为打印的是用户入参。
+                if self.verbose:
+                    print(f"并发: 请求={self.concurrency} 实际={n} 块数={_nblk}",
+                          file=sys.stderr)
                 ths = [threading.Thread(target=self._worker, args=(fh, pool_ranges),
                                         daemon=True) for _ in range(n)]
                 for t in ths:
@@ -706,10 +717,10 @@ class _FileLock:
                 pass
             self.fh.close()
             self.fh = None
-            try:
-                os.remove(self.path)
-            except OSError:
-                pass
+            # 刻意不 unlink 锁文件：删除会造成"新旧 inode 上各持一把锁"的竞态。
+            # A 释放并删除 -> B 在删除前已 open 到旧 inode（幽灵锁）-> C open 新文件
+            # 也拿到锁 -> B 和 C 同时认为自己是唯一写入者，正好绕开本锁要防的 bug。
+            # 残留的 0 字节 .lock 无害：flock 随进程退出自动释放，文件存在与否不改变语义。
 
 
 def _hash_file(path: str, algo: str, *, chunk: int = 1 << 20) -> str:
@@ -722,6 +733,30 @@ def _hash_file(path: str, algo: str, *, chunk: int = 1 << 20) -> str:
                 break
             h.update(b)
     return h.hexdigest()
+
+
+def _find_holes(fd: int, size: int):
+    """返回文件的空洞区间列表；平台不支持 SEEK_DATA/SEEK_HOLE 时返回 None。
+
+    注意：稀疏文件的空洞在语义上就是"全零且从未写过"，所以对下载器来说
+    空洞 == 未写完的区域，可以直接判定内容不完整。
+    """
+    if size <= 0 or not hasattr(os, "SEEK_HOLE") or not hasattr(os, "SEEK_DATA"):
+        return None
+    holes, off = [], 0
+    while off < size:
+        try:
+            data = os.lseek(fd, off, os.SEEK_DATA)
+        except OSError:
+            holes.append((off, size))    # 到尾都是空洞
+            break
+        if data > off:
+            holes.append((off, data))
+        try:
+            off = os.lseek(fd, data, os.SEEK_HOLE)
+        except OSError:
+            break                        # 后面全是数据
+    return holes
 
 
 def verify_file(path: str, *, algo: str = "sha256", expect: str | None = None):
@@ -740,12 +775,25 @@ def verify_file(path: str, *, algo: str = "sha256", expect: str | None = None):
 
     try:
         with open(path, "rb") as f:
+            # 优先用 SEEK_DATA/SEEK_HOLE 精确找空洞。
+            # 原先只抽 3 个偏移，实测会被"一小撮数据"骗过：在偏移 1000 写 100 字节，
+            # 偏移 0 那片 2 MB 空洞就整块漏检 —— 而偏移 0 恰恰是预分配文件最典型的空洞位置
+            # （Linux/btrfs 实测：抽样漏检，SEEK_HOLE 精确报出 4096–2097152）。
+            holes = _find_holes(f.fileno(), size)
+            if holes:
+                a, b = max(holes, key=lambda h: h[1] - h[0])
+                return False, ("发现 %d 处空洞，最大一处 偏移 %d–%d（%d 字节）"
+                               "（文件很可能是预分配后未写入）"
+                               % (len(holes), a, b, b - a))
+            # 稀疏空洞之外，还要查"非稀疏但整段全零"——truncate 预分配后被显式写零，
+            # 或并发写覆盖成零块时，SEEK_HOLE 看不到空洞，但内容同样是坏的。
+            # 只抽 3 个偏移做快速筛查（全量扫描留给摘要比对）。
             for off in (0, max(0, size // 2 - 4096), max(0, size - 4096)):
                 f.seek(off)
                 blk = f.read(4096)
                 if blk and not any(blk):
-                    return False, ("偏移 %d 处为全零空洞"
-                                   "（文件很可能是预分配后未写入）" % off)
+                    return False, ("偏移 %d 处为全零块"
+                                   "（文件很可能是预分配/覆盖后未写入）" % off)
     except OSError as e:
         return False, "读取失败: %s" % e
 

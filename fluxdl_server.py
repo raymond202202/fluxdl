@@ -30,6 +30,7 @@ class Task:
     _seq = 0
 
     def __init__(self, url, *, referer=None, cookie=None, name=None, concurrency=0):
+        # 注意：id 分配必须在 TASKS_LOCK 内完成（见 add_task），否则并发 add 会撞 id
         Task._seq += 1
         self.id = Task._seq
         self.url, self.referer, self.cookie, self.name = url, referer, cookie, name
@@ -45,7 +46,7 @@ class Task:
 
     def start(self):
         self.state = "下载中"
-        t = threading.Thread(target=self._run, daemon=True)
+        t = threading.Thread(target=self._run, daemon=True, name=f"fluxdl-task-{self.id}")
         t.start()
         return t
 
@@ -58,14 +59,25 @@ class Task:
         try:
             res = dl.run()
             self.out_path = res["path"]
-            self.state = "完成"
-            self.snapshot.update(percent=100.0, speed=0, eta=0)
+            # P0-1：面板必须像 CLI 一样做内容校验再报"完成"。
+            # 见 BUG修复记录.md —— 验收标准是内容校验通过，不是文件存在且大小对。
+            ok, info = fluxdl.verify_file(res["path"])
+            if not ok:
+                self.state = "失败"
+                self.message = f"内容校验未通过: {info}"
+            else:
+                self.state = "完成"
+                self.message = str(info or "")
+                self.snapshot.update(percent=100.0, speed=0, eta=0)
         except fluxdl.DownloadError as e:
             self.state = "失败"
             self.message = str(e)
         except Exception as e:                       # 兜底，别让线程静默死掉
             self.state = "失败"
             self.message = f"{type(e).__name__}: {e}"
+        finally:
+            # P0-2：_pick_queued 原先只在 add_task 里调用一次，任务结束后无人推进队列
+            _pick_queued()
 
     def _on_prog(self, p):
         with self._lock:
@@ -96,22 +108,61 @@ MAX_ACTIVE = 3          # 同时下载任务数，避免把带宽切碎
 
 
 def _pick_queued():
+    """把排队任务填满到 MAX_ACTIVE。
+
+    注意：一次要尽量填满，不能只启动一个 —— 多个任务同时结束时，
+    每次只补一个会让队列推进速度落在完成速度后面，形成"半卡死"。
+    """
     with TASKS_LOCK:
         active = sum(1 for t in TASKS.values() if t.state == "下载中")
-        if active >= MAX_ACTIVE:
+        free = MAX_ACTIVE - active
+        if free <= 0:
             return
-        for t in TASKS.values():
-            if t.state == "排队":
-                t.start()
-                return
+        picked = [t for t in TASKS.values() if t.state == "排队"][:free]
+        for t in picked:
+            t.state = "下载中"        # 先在锁内占位，避免并发 _pick_queued 重复启动
+    for t in picked:
+        t.start()
 
 
-def add_task(url, **kw) -> Task:
-    t = Task(url, **kw)
+def _target_key(url, kw):
+    """推导任务的「目标产物」身份，用于去重。
+
+    不能只比 URL 字符串：实测 ?u=1 / ?u=2 这种查询串变体指向同一文件，
+    按 URL 比对会漏判，于是两个任务推导出同一个文件名 -> 必然撞 _FileLock。
+    优先用调用方显式给的 name，否则用 URL 末段文件名（与内核的推导一致）。
+    """
+    name = kw.get("name")
+    if name:
+        return name
+    path = urllib.parse.urlparse(url).path
+    base = os.path.basename(path) or ""
+    return base or url
+
+
+def _same_target(t, url, kw):
+    if t.url == url:
+        return True
+    return _target_key(t.url, {"name": t.name}) == _target_key(url, kw)
+
+
+def add_task(url, **kw):
+    """新增任务。返回 (task, reused)。
+
+    P0-3：同一 URL 只允许一个活动任务。
+    内核用 _FileLock 对目标路径加排他锁，两个面板任务下载同一 URL 会推导出
+    同一个文件名，于是后到的那个必然撞锁失败 —— 对用户来说就是"我点两下，
+    第二下就红了"。正确做法不是放宽锁（那会产出一个大小对、内容全零的假成品），
+    而是在面板层去重：已有活动任务就复用它。
+    """
     with TASKS_LOCK:
+        for t in TASKS.values():
+            if t.state in ("排队", "下载中") and _same_target(t, url, kw):
+                return t, True
+        t = Task(url, **kw)          # 实例化放进锁内，避免 Task._seq 并发撞 id
         TASKS[t.id] = t
     _pick_queued()
-    return t
+    return t, False
 
 
 PAGE = r"""<!doctype html>
@@ -119,8 +170,8 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FluxDL</title>
 <style>
-:root{--bg:#fbfbfa;--card:#fff;--line:#e8e8e5;--fg:#1f2328;--dim:#8a8f98;
-      --accent:#2f6feb;--ok:#1a7f37;--err:#c9252d;--soft:#f2f4f7}
+:root{--bg:#fafaff;--card:#fff;--line:#eae7f5;--fg:#1f1f28;--dim:#8b8898;
+      --accent:#6d4aff;--ok:#1a7f37;--err:#c9252d;--soft:#f4f2fc}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
      font:14px/1.6 -apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif}
@@ -147,7 +198,7 @@ button.primary:hover{opacity:.9;color:#fff}
 .url{color:var(--dim);font-size:12px;word-break:break-all;margin-top:2px}
 .badge{font-size:12px;padding:2px 9px;border-radius:999px;border:1px solid var(--line);
        white-space:nowrap;color:var(--dim);background:var(--soft)}
-.badge.run{color:var(--accent);border-color:#cfe0ff;background:#eef4ff}
+.badge.run{color:var(--accent);border-color:#ddd4ff;background:#f1edff}
 .badge.done{color:var(--ok);border-color:#c6e8d0;background:#effaf2}
 .badge.err{color:var(--err);border-color:#f5cdd0;background:#fdf1f2}
 .bar{height:4px;background:var(--soft);border-radius:99px;margin:12px 0 8px;overflow:hidden}
@@ -204,33 +255,107 @@ async function add(){
       concurrency:+$('#conc').value})});
 }
 
+// P2-8：差分更新。原先每 800ms 用 innerHTML 全量重建，
+// 元素每次都是新建的，.bar>i 的 transition 永远没有起始宽度（进度条硬跳），
+// 而且点「取消」时按钮正在被替换，有概率点空。
+// 现在按 t.id 建一份 id -> 元素 的映射，只改变化行的文本和进度条宽度。
+const ROWS = new Map();      // id -> {el, refs}
+
+function rowHtml(t){
+  return `<div class="top">
+      <div style="min-width:0">
+        <div class="name"></div>
+        <div class="url"></div>
+      </div>
+      <div class="mini"><span class="badge"></span>
+        <button data-act="cancel">取消</button>
+      </div>
+    </div>
+    <div class="bar"><i></i></div>
+    <div class="stats">
+      <span><b class="s-pct"></b></span>
+      <span class="s-size"></span>
+      <span class="s-speed"></span>
+      <span class="s-eta"></span>
+      <span class="s-conn"></span>
+    </div>
+    <div class="msg"></div>`;
+}
+
+function makeRow(t){
+  const el = document.createElement('div');
+  el.className = 'card';
+  el.innerHTML = rowHtml(t);
+  const refs = {
+    name: el.querySelector('.name'), url: el.querySelector('.url'),
+    badge: el.querySelector('.badge'), bar: el.querySelector('.bar>i'),
+    pct: el.querySelector('.s-pct'), size: el.querySelector('.s-size'),
+    speed: el.querySelector('.s-speed'), eta: el.querySelector('.s-eta'),
+    conn: el.querySelector('.s-conn'), msg: el.querySelector('.msg'),
+    btn: el.querySelector('button[data-act=cancel]'),
+  };
+  refs.btn.addEventListener('click', () => cancel(t.id));
+  ROWS.set(t.id, {el, refs});
+  return ROWS.get(t.id);
+}
+
 function render(list){
   const box = $('#tasks');
-  if(!list.length){box.innerHTML='<div class="empty">暂无任务</div>';return}
-  box.innerHTML = list.map(t=>{
-    const pct = Math.min(t.percent||0,100);
-    const live = t.state==='下载中';
-    return `<div class="card">
-      <div class="top">
-        <div style="min-width:0">
-          <div class="name">${esc(t.name||t.url.split('/').pop())}</div>
-          <div class="url">${esc(t.url)}</div>
-        </div>
-        <div class="mini">${badge(t.state)}
-          ${(live||t.state==='排队')?`<button onclick="cancel(${t.id})">取消</button>`:''}
-        </div>
-      </div>
-      <div class="bar"><i style="width:${pct}%"></i></div>
-      <div class="stats">
-        <span><b>${pct.toFixed(1)}%</b></span>
-        <span>${fmt(t.done)} / ${t.total?fmt(t.total):'未知'}</span>
-        <span>${fmt(t.speed)}/s</span>
-        <span>剩 ${eta(t.eta)}</span>
-        <span>连接 ${t.concurrency||1}</span>
-      </div>
-      ${t.message?`<div class="msg">${esc(t.message)}</div>`:''}
-    </div>`}).join('');
+  const empty = box.querySelector('.empty');
+  if(!list.length){
+    if(!empty){ box.innerHTML = '<div class="empty">暂无任务</div>'; }
+    ROWS.clear();
+    return;
+  }
+  if(empty) empty.remove();
+
+  const seen = new Set();
+  let prev = null;
+  for(const t of list){
+    seen.add(t.id);
+    let row = ROWS.get(t.id);
+    if(!row){ row = makeRow(t); }
+    // 保持顺序：把节点按返回顺序排列（appendChild 会移动已存在节点）
+    box.appendChild(row.el);
+    prev = row;
+    updateRow(row, t);
+  }
+  for(const [id, row] of ROWS){
+    if(!seen.has(id)){ row.el.remove(); ROWS.delete(id); }
+  }
 }
+
+let lastState = new Map();
+function updateRow(row, t){
+  const r = row.refs;
+  const pct = Math.min(t.percent||0, 100);
+  const live = t.state === '下载中';
+
+  const name = t.name || (t.url||'').split('/').pop();
+  if(r.name.textContent !== name) r.name.textContent = name;
+  if(r.url.textContent !== t.url) r.url.textContent = t.url;
+
+  if(r.badge.textContent !== t.state){
+    r.badge.textContent = t.state;
+    r.badge.className = 'badge ' + ({'下载中':'run','完成':'done','失败':'err'}[t.state] || '');
+  }
+  const canCancel = live || t.state === '排队';
+  if(r.btn.style.display !== (canCancel ? '' : 'none'))
+    r.btn.style.display = canCancel ? '' : 'none';
+
+  r.bar.style.width = pct.toFixed(2) + '%';        // 只改宽度，transition 才有效
+
+  r.pct.textContent = pct.toFixed(1) + '%';
+  r.size.textContent = fmt(t.done) + ' / ' + (t.total ? fmt(t.total) : '未知');
+  r.speed.textContent = fmt(t.speed) + '/s';
+  r.eta.textContent = '剩 ' + eta(t.eta);
+  r.conn.textContent = '连接 ' + (t.concurrency || 1);
+
+  const msg = t.message || '';
+  if(r.msg.textContent !== msg) r.msg.textContent = msg;
+  r.msg.style.display = msg ? '' : 'none';
+}
+
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 
 async function cancel(id){await fetch('/api/cancel?id='+id,{method:'POST',
@@ -326,11 +451,11 @@ class Handler(BaseHTTPRequestHandler):
             url = (data.get("url") or "").strip()
             if not url.lower().startswith(("http://", "https://")):
                 return self._json({"error": "只支持 http/https"}, 400)
-            t = add_task(url, referer=data.get("referer") or None,
-                         cookie=data.get("cookie") or None,
-                         name=data.get("name") or None,
-                         concurrency=int(data.get("concurrency") or 0))
-            return self._json({"ok": True, "id": t.id})
+            t, reused = add_task(url, referer=data.get("referer") or None,
+                                 cookie=data.get("cookie") or None,
+                                 name=data.get("name") or None,
+                                 concurrency=int(data.get("concurrency") or 0))
+            return self._json({"ok": True, "id": t.id, "reused": reused})
         return self._json({"error": "not found"}, 404)
 
 
