@@ -476,3 +476,110 @@ OK
 
 **为什么这些文档必须进仓库**：别人 clone 下来只看到"一个下载器"，看不到
 "为什么这么写"。这几个 P0 的修复逻辑，靠读代码是读不出来的。
+
+---
+
+# 第三轮：Hermes 复审 v2 的 P2 全量修复（2026-10-22）
+
+上一轮（HEAD `819e7f7`）修完了 v2 的两个 P0 与五个 P1，但 v2 第 5 节的
+**P2-1 ~ P2-10 基本未动**。本轮逐条落实。
+
+## P2-1 小文件不再做自适应测速（净亏损）
+
+- **问题**：`_measure_and_pick()` 无论文件多大都跑 1.5s / 3MB 的测速。
+  一个 2MiB 的图标包，测速阶段花的时间比下载本身还长。
+- **修复**：新增 `MEASURE_MIN_TOTAL = 8MiB`；`total` 小于它就跳过测速、
+  固定 4 并发，并把 `probe_rate` 置 None（不留假速率）。
+- **验证**：5MiB → 并发 4，耗时 0.000004s；100MiB → 仍走测速。
+
+## P2-2 `_run_single()` 的锁
+
+- **现状**：`run()` 已在 `with _FileLock(self.path):` 内统一加锁，
+  `_run_single()` 是加锁后的调用，无需重复加锁。**已满足，未改**。
+
+## P2-3 面板外部输入统一校验
+
+- **问题**：`int(q.get("id"))`、`int(data.get("concurrency"))` 直接解析外部输入。
+  `GET /api/cancel?id=abc` 或 `{"concurrency":"lots"}` → `ValueError` →
+  500 + 整段 traceback 进响应和控制台。
+- **修复**：新增 `Handler._int_param(raw, default, lo, hi)`，解析失败或越界返回 None，
+  调用方回 400。`concurrency` 限制在 0–64，`id` 限制非负；另加
+  「请求体必须是 JSON 对象」检查。
+- **验证**：`id=abc` → `400 {"error":"id 必须是正整数"}`；
+  `concurrency="lots"` → `400 {"error":"concurrency 必须是 0-64 的整数"}`。
+
+## P2-4 `TASKS` 只增不减
+
+- **问题**：跑一整天几百个任务全留在字典里。前端每 800ms 一次 `/api/list`，
+  服务端每次把全部任务 `to_dict()` 序列化、前端 `render()` 再遍历一遍 ——
+  O(历史任务数) 的活儿每 0.8 秒干一次，越用越卡，内存只涨不落。
+- **修复**：新增 `HISTORY_KEEP = 200` 与 `_prune_tasks()`（须持 `TASKS_LOCK`）。
+  只淘汰终态任务（完成/失败/已取消），按 id 升序淘汰旧的，活跃任务永不淘汰；
+  `add_task()` 里顺手调用。
+- **验证**：267 条 → 200 条；`下载中` 的任务在清理后仍在。
+
+## P2-5 SSE 是死代码
+
+- **问题**：服务端 `/api/events` 的 SSE 实现写好了，但前端 `tick()` 用的是
+  800ms 轮询 —— SSE 从未被订阅，等于白写一份长连接实现 + 白跑轮询。
+- **修复**：前端改为 `EventSource('/api/events?token=...')`，`onmessage` 直接
+  `render()`；`onerror` 时退回 `pollFallback()`（老浏览器/代理掐长连接仍可用）。
+  另：`EventSource` 不能自定义请求头，故 `_auth_ok(allow_query=True)` 允许
+  SSE 从 query 取 token，并**把 SSE 分支挪到通用 token 校验之前**（否则带
+  `?token=` 的请求会被只认 header 的通用校验 403 掉，SSE 永远接不上）。
+- **验证**：`curl -N ".../api/events?token=testtoken"` 每 0.7s 收到
+  `data: {"tasks": [...]}`；错误 token → 403；无 token 的 `/api/list` → 403。
+
+## P2-6 / P2-7 cookie 与凭据
+
+- **现状**：`--cookie` 走 argv（`ps aux` 可见）属已知限制，README 已建议
+  用环境变量；本轮未改 CLI 接口。**记录为已知取舍**，非回归。
+
+## P2-8 token 比较不是常量时间
+
+- **修复**：`_auth_ok()` 改用 `hmac.compare_digest(got, TOKEN)`。
+  `==` 会在第一个不同字节提前返回，理论上可被计时侧信道逐字节试探。
+- **验证**：正常/错误 token 行为不变，仅比较方式改变。
+
+## P2-9 短读报错没有诊断价值
+
+- **问题**：差额报错只有一句「仍有区间未完成，重跑同命令可续传」，
+  既不知卡在哪个偏移，也不知应收/实收差多少。
+- **修复**：`__init__` 增加 `short_reads`（最多 8 条），worker 短读时记录
+  `{range, got, want}`；报错时输出**前 5 个未完成区间** + **首次短读明细**。
+- **验证**：故意只发一半数据的 Range 服务器 →
+  `失败: 仍有 1 个区间未完成: 100000-200000；首次短读: 请求 0-199999 应收 200000 实收 100000（共 1 次）；重跑同命令可续传`
+
+## P2-10 空洞检测不可用时静默退化
+
+- **问题**：tmpfs / NFS / CIFS / FUSE 不支持 `SEEK_DATA/SEEK_HOLE`，
+  `_find_holes()` 返回 None，只剩 3 处抽样。而「预分配伪成品」恰恰是事故主角，
+  静默退化等于悄悄降低了拦截能力。
+- **修复**：`verify_file()` 增加 `verbose` 参数；`holes is None` 且 verbose 时
+  打印降级提示。CLI 新增 `-v/--verbose` 并透传。
+- **验证**：mock `_find_holes` 返回 None → 打出
+  `[verify] 注意：本文件系统不支持空洞检测（tmpfs/网络盘常见），已退化为 3 处抽样，结果可信度下降`，且不误判为失败。
+
+## 附带修复：完成时快照 done/total 为 0
+
+- **问题**（端到端实测发现）：小文件几十毫秒就下完，`_on_prog` 的 0.25s 节流
+  可能一次都没触发，于是 `snapshot` 里 `done/total` 停在 0，而完成分支只
+  `update(percent=100.0, speed=0, eta=0)` —— 前端显示 **"0 B / 未知"但进度条 100%**，
+  自相矛盾。
+- **修复**：完成分支用 `res["size"]` 补齐 `done`/`total`。
+- **验证**：5MiB 下载完成 → `"done": 5242880, "total": 5242880`。
+
+---
+
+## 回归测试
+
+`tests/test_regression.py` 从 10 个用例扩到 **16 个**，新增：
+
+| 用例类 | 覆盖 |
+|---|---|
+| `TestP2SmallFileSkipsMeasure` | P2-1 阈值跳过 + 显式并发优先 |
+| `TestP2ShortReadDiagnostics` | P2-9 报错含区间信息 |
+| `TestP2ServerInputValidation` | P2-3 `_int_param` 边界 |
+| `TestP2TaskHistoryPruned` | P2-4 淘汰终态、保留活跃 |
+
+全部 16 个用例通过；`scripts/check_stdlib_only.py` 零依赖校验通过。

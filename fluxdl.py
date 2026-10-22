@@ -301,6 +301,7 @@ class Downloader:
         self.path = self.meta_path = ""
         self.meta = {}
         self.error = None
+        self.short_reads = []        # P2-9：短读诊断，最多留 8 条
         self.finished = False
         self.probe_rate = None
         self.pool = HttpPool(ua, referer, cookie)
@@ -372,6 +373,12 @@ class Downloader:
             if got < take:
                 with self.lock:
                     pool_ranges.insert(0, [a + got, end + 1])
+                    # P2-9：记录短读诊断。原先只留下一句"仍有区间未完成，重跑同命令可续传"，
+                    # 既不知道卡在哪个偏移，也不知道是超时/重置/对端提前关流之外还发生了什么。
+                    # 这三项（请求区间、已收字节、原因）直接决定要不要换镜像或降并发重试。
+                    if len(self.short_reads) < 8:
+                        self.short_reads.append(
+                            {"range": [a, end + 1], "got": got, "want": take})
                 return
 
     def _flush_meta(self):
@@ -384,12 +391,22 @@ class Downloader:
             # 也需要 meta 文件存在，重跑时才能识别"这是同一任务的续传"而非全新下载。
             _atomic_json(self.meta_path, self.meta)
 
+    # 小于这个体积不值得测速：测速本身最多 1.5s + 3MB 流量，
+    # 而 8MB 文件单连接也就 1s 左右下完 —— 测速比下载还贵，净亏损。
+    MEASURE_MIN_TOTAL = 8 * 1024 * 1024
+
     def _measure_and_pick(self) -> int:
         """实测单连接吞吐 → 决定并发档位（默认值不许拍脑袋）。"""
         if not self.adaptive or not self.info.get("ranges") or not self.total:
             return self.requested or 1
         if self.requested:
             return min(self.requested, self.max_concurrency)
+        # P2-1：小文件跳过测速，固定 4 并发。
+        # 原先无论多大都跑一遍 1.5s / 3MB 自适应测速：一个 2MB 的图标包，
+        # 测速阶段读完还得不到速率结论，等于先浪费 1.5s 再开始下载。
+        if self.total < self.MEASURE_MIN_TOTAL:
+            self.probe_rate = None
+            return min(4, self.max_concurrency)
         span = min(3 * 1024 * 1024, self.total - 1)
         t, got = time.time(), 0
         try:
@@ -506,8 +523,20 @@ class Downloader:
 
         if self.error:
             raise DownloadError(self.error)
-        if _gaps(self.meta, self.total):
-            raise DownloadError("仍有区间未完成，重跑同命令可续传")
+        gaps = _gaps(self.meta, self.total)
+        if gaps:
+            # P2-9：把失败区间起点 + 短读明细带出来，而不是只说"未完成"。
+            head = ", ".join("%d-%d" % (a, b) for a, b in gaps[:5])
+            more = "" if len(gaps) <= 5 else " 等 %d 段" % len(gaps)
+            diag = ""
+            if self.short_reads:
+                r = self.short_reads[0]
+                diag = ("；首次短读: 请求 %d-%d 应收 %d 实收 %d"
+                        "（共 %d 次）" % (r["range"][0], r["range"][1] - 1,
+                                          r["want"], r["got"], len(self.short_reads)))
+            raise DownloadError(
+                "仍有 %d 个区间未完成: %s%s%s；重跑同命令可续传"
+                % (len(gaps), head, more, diag))
         if os.path.exists(self.meta_path):
             os.remove(self.meta_path)
         self.finished = True
@@ -831,7 +860,8 @@ def _find_holes(fd: int, size: int):
     return holes
 
 
-def verify_file(path: str, *, algo: str = "sha256", expect: str | None = None):
+def verify_file(path: str, *, algo: str = "sha256", expect: str | None = None,
+                verbose: bool = False):
     """校验文件内容，返回 (是否通过, 说明或实际摘要)。
 
     三件事，都是本次事故的直接教训：
@@ -852,6 +882,13 @@ def verify_file(path: str, *, algo: str = "sha256", expect: str | None = None):
             # 偏移 0 那片 2 MB 空洞就整块漏检 —— 而偏移 0 恰恰是预分配文件最典型的空洞位置
             # （Linux/btrfs 实测：抽样漏检，SEEK_HOLE 精确报出 4096–2097152）。
             holes = _find_holes(f.fileno(), size)
+            # P2-10：tmpfs / 网络文件系统（NFS/CIFS/FUSE）不支持 SEEK_DATA/SEEK_HOLE，
+            # _find_holes 返回 None，此时只剩下面 3 处抽样 —— 静默退化等于悄悄降低了
+            # "预分配伪成品"的拦截能力，而这类文件恰恰是事故主角。
+            # 不报错（抽样仍有价值），但要在 verbose 下说清楚，别让人误以为做了全量检测。
+            if holes is None and verbose:
+                print("[verify] 注意：本文件系统不支持空洞检测（tmpfs/网络盘常见），"
+                      "已退化为 3 处抽样，结果可信度下降", flush=True)
             if holes:
                 a, b = max(holes, key=lambda h: h[1] - h[0])
                 return False, ("发现 %d 处空洞，最大一处 偏移 %d–%d（%d 字节）"
@@ -924,6 +961,8 @@ def main(argv) -> int:
                     help="下载后用 sha256 校验，不匹配则退出码 2（强烈建议在脚本中使用）")
     ap.add_argument("--no-verify", action="store_true",
                     help="跳过下载后的内容自检（默认会检测空洞/gzip 魔数）")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="输出诊断信息（如文件系统不支持空洞检测时的降级提示）")
     a = ap.parse_args(argv)
 
     if a.probe:
@@ -963,9 +1002,14 @@ def main(argv) -> int:
     # ---- 内容校验：不再只信"文件大小"，必须验内容 ----
     # 这是本次事故的核心教训：预分配会让文件大小秒变正确，但里面全是空洞。
     if not a.no_verify:
-        ok, info = verify_file(res["path"], expect=a.expect_sha256)
+        ok, info = verify_file(res["path"], expect=a.expect_sha256,
+                               verbose=a.verbose)
         if ok:
-            print(f"校验通过: sha256={info}")
+            # 无 --expect-sha256 时 info 为空串（P1-4 已跳过全量摘要），
+            # 直接打印 "sha256=" 会让人误解成"算了但没值"。
+            print("校验通过: sha256=%s" % info if info else
+                  "校验通过（未提供 --expect-sha256，已跳过摘要比对；"
+                  "空洞/抽样/gzip 魔数检查已完成）")
         else:
             print(f"校验失败: {info}", file=sys.stderr)
             print("文件内容不可信，请删除后重下（或检查网络/代理是否篡改响应）。",
