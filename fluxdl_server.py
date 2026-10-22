@@ -344,6 +344,10 @@ def _scan_resumable() -> int:
             if size and done >= size:
                 continue                     # 已经下满：只是没来得及提升成成品
             t = Task(url, name=os.path.basename(part))
+            # D3：不补 out_path 的话 to_dict() 走 basename(out_path) → path 为空串，
+            # 面板路径列空白，用户不知道这残件是哪个文件。resume 时内核会按同一
+            # 路径续传（_derive_path 推导结果一致），所以直接指向半成品即可。
+            t.out_path = part
             t.state = "可续传"
             t.done_bytes = done
             t.total_bytes = size
@@ -1019,27 +1023,61 @@ def _shutdown(srv, signame="SIGINT"):
                   f"（sidecar 缺失，续传不可用）")
     else:
         print("无进行中的任务")
-    print(f"bye ({signame})")
+    # D1：这里【不能】再调 srv.shutdown()。
+    # socketserver.BaseServer.shutdown() 的实现是：
+    #     self.__shutdown_request = True
+    #     self.__is_shut_down.wait()      # 等 serve_forever() 退出时 set
+    # 而 serve_forever() 只有【主线程】自己在跑。若在信号处理函数（主线程）里
+    # 同步调 shutdown()，等的人和干活的是同一个线程 → 永久互等，
+    # /proc/<pid>/task/*/wchan 全是 futex_do_wait（实测挂死 20s+，只能 kill -9）。
+    # 关 server 的动作交给 main() 在 serve_forever() 返回之后做，或在独立线程里做。
+
+
+def _request_shutdown(srv):
+    """在【独立线程】里请求 serve_forever() 退出（D1）。"""
     try:
         srv.shutdown()
     except Exception:
         pass
 
 
+def _line_buffer_stdio():
+    """D2：非 tty（systemd / docker / 重定向到文件）时 stdout 是全缓冲的。
+
+    横幅里有 token，而 P1-A 之后 token 只能手动粘贴 —— 日志里迟迟不出现
+    「token: ...」等于面板不可用；排障时 docker logs 也是空的。
+    reconfigure 在 Py3.7+ 可用，老版本/异常环境退回 flush=True 兜底。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+
+
 def main():
+    _line_buffer_stdio()
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
-    print(f"FluxDL 面板: http://{HOST}:{PORT}/")
-    print(f"token: {TOKEN}")
-    print(f"目录: {DOWNLOAD_DIR}")
+    print(f"FluxDL 面板: http://{HOST}:{PORT}/", flush=True)
+    print(f"token: {TOKEN}", flush=True)
+    print(f"目录: {DOWNLOAD_DIR}", flush=True)
     n = _scan_resumable()
     if n:
         print(f"发现 {n} 个可续传任务（磁盘上的 .fluxdl），面板里点「继续」即可")
 
     def _on_signal(signum, frame):
-        _shutdown(srv, signal.Signals(signum).name)
-        raise SystemExit(0)
+        # D1：信号处理函数在【主线程】执行，而主线程此刻正阻塞在 serve_forever()。
+        # 所以这里只做两件事：停任务（可以直接做）+ 把 shutdown 丢到独立线程。
+        # 不能在这里 srv.shutdown()（同线程自等死锁），也不能 raise SystemExit
+        # （那会跳过收尾，且 SystemExit 在别的线程里 raise 只结束该线程）。
+        name = signal.Signals(signum).name
+        try:
+            _shutdown(srv, name)
+        finally:
+            threading.Thread(target=_request_shutdown, args=(srv,),
+                             name="fluxdl-shutdown", daemon=True).start()
 
     for s in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -1049,7 +1087,15 @@ def main():
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
+        # 兜底：没装成信号处理器时的 Ctrl-C
         _shutdown(srv, "SIGINT")
+    finally:
+        # serve_forever() 已返回 → 主线程不再阻塞，这里确保 socket 关掉。
+        # join 给 shutdown 线程一点时间（它可能刚启动），但绝不无限等。
+        try:
+            srv.server_close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
