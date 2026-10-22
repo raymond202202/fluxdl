@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
+*.pyo
 *.lock
+*.part
+.*.segments/
+build/
+dist/
+*.egg-info/
+.pytest_cache/

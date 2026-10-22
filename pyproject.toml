@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fluxdl"
+version = "0.3.0"
+description = "自研轻量多线程下载器与 Web 面板（零第三方依赖）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["downloader", "multithread", "range", "hls", "aria2-alternative"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Internet :: File Transfer Protocol (FTP)",
+]
+# 刻意留空：FluxDL 只用标准库。第三方依赖为零是特性，不是遗漏。
+# 唯一的外部程序依赖是 HLS 合并所需的 ffmpeg（运行时按需检测）。
+dependencies = []
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+fluxdl = "fluxdl_cli:run"
+
+[tool.setuptools]
+py-modules = ["fluxdl", "fluxdl_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

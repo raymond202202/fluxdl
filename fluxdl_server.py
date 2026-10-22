@@ -41,6 +41,7 @@ class Task:
                          "total": 0, "concurrency": 0}
         self.message = ""
         self.out_path = ""
+        self.cancelled_before_start = False   # P1-2：线程启动前就被取消
         self.created = time.time()
         self._lock = threading.Lock()
 
@@ -51,13 +52,24 @@ class Task:
         return t
 
     def _run(self):
-        dl = fluxdl.Downloader(
-            self.url, DOWNLOAD_DIR, concurrency=self.requested,
-            referer=self.referer, cookie=self.cookie, override_name=self.name,
-            on_progress=self._on_prog)
-        self.dl = dl
+        # P1-1：Downloader(...) 的构造必须放在 try 内。
+        # 原先构造在 try 之外，一旦构造抛异常（URL 非法、目录不可写、参数校验失败），
+        # 线程直接死掉，state 永久停在"下载中"，MAX_ACTIVE 计数只增不减 ——
+        # 累计 3 次之后面板再也起不了新任务，只能重启。
         try:
-            res = dl.run()
+            # P1-2：cancel() 发生在"置下载中"之后、"线程真正跑起来"之前的窗口期里，
+            # 原先线程照样建 Downloader 并 run() 到底，结束时又把 state 覆盖成"完成" ——
+            # 用户点了取消，文件却继续下完并显示成功。
+            if self.cancelled_before_start or self.state == "已取消":
+                self.state = "已取消"
+                return
+
+            self.dl = fluxdl.Downloader(
+                self.url, DOWNLOAD_DIR, concurrency=self.requested,
+                referer=self.referer, cookie=self.cookie, override_name=self.name,
+                on_progress=self._on_prog)
+
+            res = self.dl.run()
             self.out_path = res["path"]
             # P0-1：面板必须像 CLI 一样做内容校验再报"完成"。
             # 见 BUG修复记录.md —— 验收标准是内容校验通过，不是文件存在且大小对。
@@ -65,13 +77,19 @@ class Task:
             if not ok:
                 self.state = "失败"
                 self.message = f"内容校验未通过: {info}"
+            elif self.cancelled_before_start or self.state == "已取消":
+                # 下载过程中被取消：run() 可能已经落盘，但状态不能被"完成"覆盖
+                self.state = "已取消"
             else:
                 self.state = "完成"
                 self.message = str(info or "")
                 self.snapshot.update(percent=100.0, speed=0, eta=0)
         except fluxdl.DownloadError as e:
-            self.state = "失败"
-            self.message = str(e)
+            if self.cancelled_before_start or self.state == "已取消":
+                self.state = "已取消"
+            else:
+                self.state = "失败"
+                self.message = str(e)
         except Exception as e:                       # 兜底，别让线程静默死掉
             self.state = "失败"
             self.message = f"{type(e).__name__}: {e}"
@@ -88,8 +106,12 @@ class Task:
                 concurrency=p.get("concurrency", 0))
 
     def cancel(self):
+        # P1-2：dl 还没建出来时也要留下"取消过"的痕迹，
+        # 否则线程启动后无从得知自己被取消过。
         if self.dl:
             self.dl.stop()
+        else:
+            self.cancelled_before_start = True
         if self.state in ("排队", "下载中"):
             self.state = "已取消"
 
@@ -128,16 +150,23 @@ def _pick_queued():
 def _target_key(url, kw):
     """推导任务的「目标产物」身份，用于去重。
 
-    不能只比 URL 字符串：实测 ?u=1 / ?u=2 这种查询串变体指向同一文件，
-    按 URL 比对会漏判，于是两个任务推导出同一个文件名 -> 必然撞 _FileLock。
-    优先用调用方显式给的 name，否则用 URL 末段文件名（与内核的推导一致）。
+    只比 URL 字符串会漏判：实测 ?u=1 / ?u=2 这种查询串变体指向同一文件，
+    两个任务推导出同一个文件名 -> 必然撞 _FileLock。所以这里忽略查询串。
+
+    但**不能退化成裸文件名** —— 文件名不是身份。上一版正是这么写的，
+    结果 v1/app.zip 与 v2/app.zip、a.com/setup.exe 与 b.com/setup.exe
+    被判为同一目标，第二个请求 add_task 直接返回 reused=True，面板显示"完成"，
+    第二个文件从未下载且无任何报错（比撞锁更难发现，撞锁至少会红）。
+
+    正确身份 = (host + path, 产物名)：host 与 path 都相同、只在查询串上不同
+    才视为同一目标。"忽略 query"已经满足 ?u=1/?u=2 的原始诉求，不必牺牲 host/path。
     """
+    u = urllib.parse.urlparse(url)
     name = kw.get("name")
-    if name:
-        return name
-    path = urllib.parse.urlparse(url).path
-    base = os.path.basename(path) or ""
-    return base or url
+    if not name:
+        base = os.path.basename(u.path) or ""
+        name = base or url
+    return (u.netloc.lower() + u.path, name)
 
 
 def _same_target(t, url, kw):
