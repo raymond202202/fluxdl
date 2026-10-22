@@ -331,3 +331,148 @@ if self.verbose:
 2. **面板去重只比 URL 字符串不够**
    实测 `?u=1` / `?u=2` 指向同一文件，按 URL 比对漏判 → 仍然撞锁。
    改为按「目标文件名」去重（优先显式 `name`，否则取 URL 末段，与内核推导一致）。
+
+---
+
+# 第三轮：Hermes 复审 v2（2026-10-22）
+
+> 基线：`代码评审-Hermes-v2.md`。上一轮修 P0 时**自己引入了一条回归**，
+> 且"不要只信文件存在/大小"的教训没有贯彻到底 —— 这轮的核心不是加功能，是把静默成功彻底堵死。
+
+## 一句话回顾
+
+上一轮结束时我以为"内容校验通过"就等于安全了。复审 v2 指出：
+**文件大小对、内容校验也"通过"，但它仍然是残的。**
+两个 P0 的共同特征都是「报错为零」。
+
+## 修复总览
+
+| # | 问题 | 严重度 | 后果 | 状态 |
+|---|---|---|---|---|
+| P0-1 | `_run_single()` EOF 即转正，不比对 `Content-Length` | **致命** | 声明 100000 实收 60000，仍然 `校验通过` + 退出码 0 | ✅ 已修 |
+| P0-2 | `_target_key()` 退化成裸文件名 | **致命** | v1/v2 同名包、不同站同名 exe 被判同一目标，第二个**从未下载**却显示"完成" | ✅ 已修 |
+| P1-1 | `Downloader(...)` 构造在 `try` 之外 | 高 | 构造异常 → 线程死、名额不归还，3 次后面板再也起不了新任务 | ✅ 已修 |
+| P1-2 | 取消竞态 | 高 | 点取消后文件继续下完，最后状态被覆盖成"完成" | ✅ 已修 |
+| P1-3 | `drain()` = `resp.read()` 无上限 | 高 | probe 回退路径把 1.5GB 读进内存 | ✅ 已修 |
+| P1-4 | 无 `expect` 也全量算 sha256 | 中 | 200MiB 文件下载 1.8s、哈希 1–2s，自己吃掉一半加速 | ✅ 已修 |
+| P1-5 | HLS 忽略 `#EXT-X-KEY` / `#EXT-X-MAP` | 中 | 密文分片/无 moov 的 fMP4，ffmpeg 返回 0 → 报"完成" | ✅ 已修 |
+
+## P0-1：截断文件被当成成品
+
+### 复现（已固化为测试）
+socket 服务器声明 `Content-Length: 100000`、实发 60000 后优雅关闭，且**不返回
+`Accept-Ranges`**，逼内核走 `_run_single()`。旧代码：
+
+```
+run() 返回成功: {'size': 60000}
+verify_file: (True, 'ffb240...')
+```
+
+### 根因
+```python
+buf = r.read(65536)
+if not buf:
+    break                     # ← EOF 静默 break
+os.replace(part, self.path)   # ← 直接转正
+```
+`verify_file()` 四道检查全部看不见：非稀疏无空洞、数据是真的 0x01、非 gzip、
+无 `expect` 时 sha256 只算不比。
+
+### 修复
+`os.replace()` 之前加断言，并清掉 `.part`：
+```python
+if self.total and n != self.total:
+    os.remove(part)
+    raise DownloadError("响应被截断：Content-Length=%d，实收 %d 字节（差 %d）")
+```
+
+### 为什么这条最危险
+无 Range 的服务器**很常见**：CDN 边缘节点、对象存储签名 URL、反向代理配错。
+网络抖动/限速掐连接都会走到这条路径。用户拿到一个能打开但内容残缺的 zip/安装包/pdf。
+
+## P0-2：按文件名去重 —— 上一轮修复引入的回归
+
+### 实测
+```
+a.com/v1/pack.zip -> 判为同一目标: True
+b.com/v2/pack.zip
+```
+
+### 根因
+上一轮为修 P0-3（同 URL 连点撞 `_FileLock`）把去重键降级成裸文件名：
+
+```python
+def _target_key(url, kw):
+    name = kw.get("name")
+    if name: return name
+    return os.path.basename(urlparse(url).path) or url
+```
+
+**文件名不是身份。** 上一轮末尾我自己写的"改为按目标文件名去重"，
+恰恰就是这条 bug 的源头 —— 为了兜住 `?u=1/?u=2`，牺牲了 host 和 path。
+
+### 修复
+```python
+u = urlparse(url)
+name = kw.get("name") or basename(u.path) or url
+return (u.netloc.lower() + u.path, name)
+```
+忽略 query 就满足 `?u=1/?u=2` 的原诉求，不需要牺牲 host/path。
+
+## P1 五条
+
+### P1-1 任务槽位泄漏
+构造挪进 `try`，`finally` 里的 `_pick_queued()` 因此一定执行。
+（重写 `_run()` 时踩了一次坑：把原内层 `try` 的 `except` 缩进搞错，见 FLARE问题记录。）
+
+### P1-2 幽灵取消
+三处同时改：
+1. `cancel()` 在 `dl is None` 时置 `cancelled_before_start = True`；
+2. `_run()` 开头检查，已取消则立刻 `return`（但仍走 `finally` 归还名额）；
+3. 写 `state="完成"` 前再检查一次，取消状态不被覆盖。
+
+### P1-3 探测/收尾无界读
+`drain(resp, max_bytes=65536)`，`resp.read(max_bytes)`；probe 两处传 `0` 只读头。
+进入这条分支的前提正是"服务器不标准"，所以它才是危险路径。
+
+### P1-4 无谓的全量哈希
+`if not expect: return True, ""` —— 没有比对对象时摘要纯属净亏损。
+
+### P1-5 HLS 静默产出坏视频
+新增 `_m3u8_guards()` + `_check_hls_supported()`：
+- `#EXT-X-KEY:METHOD` 非 `NONE` → 明确报"加密流不支持"；
+- `#EXT-X-MAP` → 明确拒绝（直接 concat 得到无 moov 的坏文件）。
+
+另外 `subprocess.run(ffmpeg)` 补 `timeout=1800`，避免永久"合并中"且不响应取消。
+
+## 验证：测试不是文档，测试会变红
+
+新增 `tests/test_regression.py`，10 个用例。关键做法是**验证测试本身有效**：
+
+```
+# 临时去掉 P0-1 的断言
+$ python3 -m unittest discover -s tests -k truncated
+FAIL: test_truncated_single_conn_raises
+AssertionError: DownloadError not raised      ← 修复回退则变红
+
+# 恢复修复
+$ python3 -m unittest discover -s tests
+Ran 10 tests in 1.129s
+OK
+```
+
+一个不会变红的测试等于没写。
+
+## 工程化（复审第 6、8 条）
+
+| 项 | 处理 |
+|---|---|
+| `LICENSE` | 新增 MIT —— 公开仓库无授权 = 别人连合法 fork 都算不上 |
+| `pyproject.toml` | 新增；`dependencies = []` 显式声明零依赖，`[project.scripts]` 提供 `fluxdl` 命令 |
+| `fluxdl_cli.py` | 新增入口封装（内核 `main(argv)` 需要显式传参，console_scripts 不带参数） |
+| `.github/workflows/tests.yml` | 新增 CI：3.10/3.12/3.13 矩阵 + compile + unittest + 零依赖校验 |
+| `scripts/check_stdlib_only.py` | 新增；用 `sys.stdlib_module_names` 守着"零依赖"这个卖点 |
+| 事故档案入库 | `BUG修复记录.md` / `代码评审-Hermes.md` / `代码评审-Hermes-v2.md` / `FLARE问题记录.md` 全部提交 |
+
+**为什么这些文档必须进仓库**：别人 clone 下来只看到"一个下载器"，看不到
+"为什么这么写"。这几个 P0 的修复逻辑，靠读代码是读不出来的。

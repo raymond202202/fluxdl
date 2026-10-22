@@ -149,9 +149,15 @@ class HttpPool:
         raise DownloadError("重定向次数过多")
 
     @staticmethod
-    def drain(resp):
+    def drain(resp, max_bytes: int = 65536):
+        """读掉少量残留 body 后断开。
+
+        原先直接 resp.read() 无上限：而调用它的场景恰恰是"服务器不标准"
+        （probe 的 HEAD 回退碰到忽略 Range 返回 200 全量、_run_single 异常收尾），
+        一个 1.5GB 文件会被一次性读进内存，或者二次卡死在无响应的连接上。
+        """
         try:
-            resp.read()
+            resp.read(max_bytes)
         except Exception:
             pass
 
@@ -190,7 +196,8 @@ def probe(url: str, *, ua=None, referer=None, cookie=None) -> dict:
             info["size"] = int(cl)
         if (h.get("Transfer-Encoding", "") or "").lower() == "chunked":
             info["ranges"], info["size"] = False, None
-        pool.drain(r)
+        # 只要响应头，body 一个字都不要读（HEAD 路径本无 body）
+        pool.drain(r, 0)
     except Exception as e:
         code = getattr(e, "code", None)
         try:                                    # HEAD 不被支持时用单字节 GET 探 Content-Range
@@ -204,7 +211,7 @@ def probe(url: str, *, ua=None, referer=None, cookie=None) -> dict:
             info["content_type"] = info["content_type"] or r.headers.get("Content-Type")
             info["filename"] = info["filename"] or _filename(
                 final, r.headers.get("Content-Disposition"))
-            pool.drain(r)
+            pool.drain(r, 0)
         except Exception as e2:
             info["error"] = f"HTTP {code or '?'} → {type(e2).__name__}: {e2}"
 
@@ -535,6 +542,20 @@ class Downloader:
             self.pool.drain(r)
         if self.stop_flag.is_set():
             raise DownloadError("已取消（此服务器不支持 Range，需重新下载）")
+        # 关键：EOF 不等于收全。无 Range 的服务器（CDN 边缘、对象存储签名 URL、
+        # 反向代理配错）在网络抖动/限速掐连接时会提前关闭，read() 返回空就 break，
+        # 若这里不比对 Content-Length，就会把残件 os.replace 成"成品"，
+        # 而 verify_file() 的洞检测/抽样/gzip 魔数全都看不出来（非稀疏、数据非零），
+        # 无 expect 时 sha256 也只算不比对 —— 全链路报成功，退出码 0。
+        # 实测：声明 100000 实收 60000，旧代码返回 size=60000 且校验通过。
+        if self.total and n != self.total:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            raise DownloadError(
+                "响应被截断：Content-Length=%d，实收 %d 字节（差 %d）"
+                % (self.total, n, self.total - n))
         os.replace(part, self.path)
         self.finished = True
         return {"path": self.path, "kind": "file", "size": n}
@@ -543,6 +564,30 @@ class Downloader:
 # ----------------------------------------------------------------------------
 # HLS
 # ----------------------------------------------------------------------------
+def _m3u8_guards(text: str):
+    """检查加密/fMP4 初始化段，这两类靠 concat + ffmpeg -c copy 拼不出能播的视频。
+
+    #EXT-X-KEY:METHOD=AES-128,... —— 分片是密文，直接 concat 得到一堆加密字节，
+        但 ffmpeg 仍可能返回 0，面板就报"完成"；
+    #EXT-X-MAP:URI="init.mp4"   —— fMP4 的 moov 在 init segment 里，丢掉后拼出来的
+        文件没有索引，播放器打不开。
+    这两种情况要明确报错，而不是装成功。
+    """
+    maps, encrypted = [], False
+    for l in (ln.strip() for ln in text.splitlines()):
+        if not l.startswith("#EXT-X-KEY"):
+            if l.startswith("#EXT-X-MAP"):
+                m = re.search(r'URI="([^"]+)"', l)
+                if m:
+                    maps.append(m.group(1))
+            continue
+        m = re.search(r"METHOD=([^,\s]+)", l, re.I)
+        method = (m.group(1).upper() if m else "")
+        if method and method != "NONE":
+            encrypted = True
+    return encrypted, maps
+
+
 def _parse_m3u8(text: str, base: str):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):
@@ -570,12 +615,35 @@ def _resolve_segments(url: str, pool: HttpPool, depth=0):
     return segs
 
 
+def _check_hls_supported(url: str, pool: HttpPool, depth=0) -> None:
+    """沿 master -> media 走一遍，加密流或 fMP4 初始化段直接拒绝。
+
+    宁可明确报"不支持"，也不要合并出一个返回 0 的坏视频。
+    """
+    conn, r, final = pool.open(url)
+    body = r.read().decode("utf-8", "replace")
+    pool.drain(r, 0)
+    encrypted, maps = _m3u8_guards(body)
+    if encrypted:
+        raise DownloadError(
+            "该 HLS 流已加密（#EXT-X-KEY METHOD=AES-128 等），当前不支持解密")
+    if maps:
+        raise DownloadError(
+            "该 HLS 流为 fMP4（含 #EXT-X-MAP 初始化段），"
+            "直接 concat 会得到无 moov 的坏文件，当前不支持。init: %s"
+            % ", ".join(maps[:3]))
+    segs, master = _parse_m3u8(body, final)
+    if master and segs and depth < 3:
+        _check_hls_supported(segs[0], pool, depth + 1)
+
+
 def hls_download(url, out_dir, *, name=None, ua=None, referer=None, cookie=None,
                  concurrency=8, on_progress=None, stop=None) -> str:
     on_progress = on_progress or (lambda p: None)
     stop = stop or threading.Event()
     os.makedirs(out_dir, exist_ok=True)
     pool = HttpPool(ua, referer, cookie)
+    _check_hls_supported(url, pool)
     segs = _resolve_segments(url, pool)
     if not segs:
         raise DownloadError("m3u8 未解析出任何分片")
@@ -644,10 +712,14 @@ def hls_download(url, out_dir, *, name=None, ua=None, referer=None, cookie=None,
     out = os.path.join(out_dir, stem + ".mp4")
     if not shutil.which("ffmpeg"):
         raise DownloadError("分片已下完，但缺 ffmpeg 无法合并")
-    p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                        "-f", "concat", "-safe", "0", "-i", playlist,
-                        "-c", "copy", "-bsf:a", "aac_adtstoasc", out],
-                       capture_output=True, text=True)
+    try:
+        # 没有 timeout 时 ffmpeg 一卡住，任务就永久停在"合并中"且不响应取消
+        p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "concat", "-safe", "0", "-i", playlist,
+                            "-c", "copy", "-bsf:a", "aac_adtstoasc", out],
+                           capture_output=True, text=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        raise DownloadError("ffmpeg 合并超时（30 分钟），分片已保留在 %s" % seg_dir)
     if p.returncode != 0:
         raise DownloadError(f"ffmpeg 合并失败: {p.stderr.strip()[:300]}")
     shutil.rmtree(seg_dir, ignore_errors=True)
@@ -802,6 +874,12 @@ def verify_file(path: str, *, algo: str = "sha256", expect: str | None = None):
             magic = f.read(2)
         if magic != b"\x1f\x8b":
             return False, "gzip 魔数不符（文件已损坏）"
+
+    # 没有 expect 就没有比对对象，全量算摘要纯属净亏损：
+    # 200MiB 文件下载本身 1.8s，sha256 还要 1–2s，等于自己把加速吃掉一半。
+    # 此时只做存在性 + 空洞 + 抽样 + gzip 魔数即可。
+    if not expect:
+        return True, ""
 
     try:
         actual = _hash_file(path, algo)
