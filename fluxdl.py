@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 
 DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -186,6 +187,19 @@ def probe(url: str, *, ua=None, referer=None, cookie=None) -> dict:
     pool = HttpPool(ua, referer, cookie, timeout=15)
     try:
         conn, r, final = pool.open(url, method="HEAD")
+        # P1-3（本轮实测，比评审描述的更严重）：
+        # HEAD 返回 4xx/5xx【不会抛异常】，pool.open 照常返回 response。
+        # 于是主分支直接信任了这个错误页的 Content-Length / Accept-Ranges：
+        #   实测 python -m http.server 之类不实现 HEAD 的服务端回 501 +
+        #   Content-Length: 482（那是 HTML 错误页的长度）→
+        #   probe 得出 size=482、ranges=False →
+        #   run() 静默降级走 _run_single()（"无 Range 支持，明确不做续传"）→
+        #   没有 .fluxdl sidecar，中途取消/中断断点全丢，产物只剩 .part。
+        # 用户看到的是"这个地址不能续传"，而服务器其实完全支持 206。
+        # 判据：HEAD 必须 2xx 才可信；否则一律进 except 走 GET 探测。
+        if not (200 <= r.status < 300):
+            raise urllib.error.HTTPError(url, r.status,
+                                         f"HEAD 不可用（{r.status}）", r.headers, None)
         info["status"], info["final_url"] = r.status, final
         h = r.headers
         info["content_type"] = h.get("Content-Type")
@@ -208,6 +222,23 @@ def probe(url: str, *, ua=None, referer=None, cookie=None) -> dict:
                 total = cr.split("/")[-1].strip()
                 if total.isdigit():
                     info["size"], info["ranges"] = int(total), True
+            # P1-3（本轮实测）：不能只看 Content-Range。
+            # 很多简易服务端不回 Content-Range，但仍回 206 + Accept-Ranges: bytes
+            # —— 这已经足够证明"支持 Range"，而原实现只认 Content-Range，
+            # 于是把支持续传的服务器判成"不支持"，静默降级走 _run_single()：
+            # 没有 sidecar、中途中断断点全丢（产物只剩 .part）。
+            # 触发条件极常见：服务端不实现 HEAD（返回 501）→ 走本分支。
+            if not info["ranges"]:
+                if r.status == 206:
+                    info["ranges"] = True
+                elif (r.headers.get("Accept-Ranges", "") or "").lower() == "bytes":
+                    info["ranges"] = True
+            if info["size"] is None:
+                cl2 = r.headers.get("Content-Length")
+                # 206 的 Content-Length 只是"这一小段"的长度，不能当总大小；
+                # 只有 200 全量响应时它才等于文件大小。
+                if r.status == 200 and cl2 and cl2.isdigit():
+                    info["size"] = int(cl2)
             info["content_type"] = info["content_type"] or r.headers.get("Content-Type")
             info["filename"] = info["filename"] or _filename(
                 final, r.headers.get("Content-Disposition"))

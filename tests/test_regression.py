@@ -283,5 +283,99 @@ class TestP2TaskHistoryPruned(unittest.TestCase):
             fs.TASKS.clear()
 
 
+
+class _NoHeadRangeHandler(http.server.BaseHTTPRequestHandler):
+    """支持 Range，但不实现 HEAD（回 501 + HTML 错误页）。
+
+    这是 P1-3 的复现条件，也是本轮实测抓到的真 bug：
+    python -m http.server / 各种简易静态服务 / 部分对象存储默认不开 HEAD。
+    """
+    payload = bytes(range(256)) * 4000      # 1024000 字节，可切成多块
+
+    def do_GET(self):
+        rng = self.headers.get("Range")
+        total = len(self.payload)
+        if rng and rng.startswith("bytes="):
+            a, _, b = rng[6:].partition("-")
+            start, end = int(a or 0), int(b or total - 1)
+            end = min(end, total - 1)
+            chunk = self.payload[start:end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+        else:
+            chunk = self.payload
+            self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(chunk)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        self.wfile.write(chunk)
+
+    def do_HEAD(self):
+        # 故意回 501 + 一个短 HTML 错误页，长度和真实文件毫无关系
+        body = b"<html><body>501 Unsupported method (HEAD)</body></html>"
+        self.send_response(501)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class TestProbeNoHead(unittest.TestCase):
+    """P1-3：HEAD 回 501 时 probe 必须回退到 GET 探测，不能信错误页。
+
+    事故形态（本轮实测，比评审描述的更严重）：
+      HEAD 501 不抛异常 → 主分支直接信任错误页的 Content-Length（482）和
+      缺失的 Accept-Ranges → probe 得出 size=482 / ranges=False →
+      run() 静默降级 _run_single()（明确不做续传）→ 没有 .fluxdl sidecar →
+      中途中断断点全丢，只剩 .part。用户被告知"该地址不支持续传"，
+      而服务器其实完全支持 206。
+    """
+
+    def setUp(self):
+        self._srv = http.server.ThreadingHTTPServer(("127.0.0.1", _free_port()),
+                                                    _NoHeadRangeHandler)
+        self._srv.daemon_threads = True
+        self._port = self._srv.server_address[1]
+        self._th = threading.Thread(target=self._srv.serve_forever, daemon=True)
+        self._th.start()
+
+    def tearDown(self):
+        self._srv.shutdown()
+        self._srv.server_close()
+
+    def test_probe_detects_range_when_head_501(self):
+        import fluxdl
+        url = f"http://127.0.0.1:{self._port}/f.bin"
+        info = fluxdl.probe(url)
+        self.assertTrue(info["ranges"], f"应识别出支持 Range，实际 info={info}")
+        self.assertEqual(info["size"], len(_NoHeadRangeHandler.payload),
+                         "size 必须来自真实文件，而不是 HEAD 错误页的 Content-Length")
+        self.assertIsNone(info["note"], "不应再提示「不支持 Range」")
+
+    def test_resume_sidecar_created_when_head_501(self):
+        """端到端：能续传的地址必须落 .fluxdl，否则判为不可续传就是回归。"""
+        import fluxdl
+        url = f"http://127.0.0.1:{self._port}/f.bin"
+        d = fluxdl.Downloader(url, self._tmp(), concurrency=2)
+        d.stop()                    # 立刻停：只为验证路径选择，不等下完
+        try:
+            d.run()
+        except Exception:
+            pass
+        self.assertEqual(d.meta_path, os.path.join(d.out_dir,
+                                                   (d.info.get("filename") or "x") + ".fluxdl"))
+        self.assertNotEqual(d.finished, True, "被 stop 了不该算完成")
+
+    def _tmp(self):
+        import tempfile
+        t = tempfile.mkdtemp(prefix="fluxdl_probe_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(t, ignore_errors=True))
+        return t
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

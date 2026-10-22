@@ -14,6 +14,8 @@ import hmac
 import json
 import os
 import secrets
+import signal
+import sys
 import threading
 import time
 import urllib.parse
@@ -27,17 +29,79 @@ TOKEN = os.environ.get("FLUXDL_TOKEN") or secrets.token_urlsafe(16)
 DOWNLOAD_DIR = os.environ.get("FLUXDL_DIR") or os.path.expanduser("~/Downloads/FluxDL")
 
 
+# ---------------------------------------------------------------- P1-A 安全基线
+# token 唯一的用途是挡住"浏览器里的其他站点"打本机 127.0.0.1 的 API
+# （CSRF / DNS rebinding）。Host 头白名单是 rebinding 的标准挡法：
+# 攻击者页面把 evil.com 解析到 127.0.0.1 时，浏览器发出的 Host 仍是 evil.com:PORT。
+ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}", f"[::1]:{PORT}"}
+_HOME = os.path.expanduser("~")
+
+# SSE 一次性 nonce：EventSource 不能自定义请求头，token 只能进 URL；
+# 但把【长期 token】放进 URL 太脏（历史记录/日志），所以换成短期一次性凭证。
+NONCE_TTL = 600          # 10 分钟足够打开一个标签页
+NONCE_MAX = 64
+_NONCES: dict[str, float] = {}
+_NONCES_LOCK = threading.Lock()
+
+# P2-C：SSE 客户端上限。每个客户端 = 一个常驻线程 + 每 0.7s 一次序列化，
+# 不限量的话"开一堆标签页"就能把 GIL 和带宽吃光。超限直接 503。
+SSE_MAX = 4
+_SSE_ACTIVE = 0
+_SSE_LOCK = threading.Lock()
+SSE_INTERVAL = 0.7
+
+# P2-B：全局连接预算。MAX_ACTIVE 的注释写的是"避免把带宽切碎"，
+# 但 /api/add 允许 concurrency 到 64 → 3×64=192 条连接，正好是最碎的用法。
+# 改成"全局最多 8 个任务 × 每个任务上限 16"这种乘法式的显式预算：
+# 同时下载任务数与单任务并发相乘不超过 CONN_BUDGET 条 TCP 连接。
+# 16 的取值不是拍脑袋：内核 max_concurrency 硬上限就是 16
+# （fluxdl.py:290 `min(int(max_concurrency), 16)`），传 >16 也只是被静默截断，
+# 反而让用户以为"我设了 64"。降到 16 后面板接受的参数与内核实际行为一致，
+# 2 个任务 × 16 = 32 条连接，是家用带宽上一个经得起实测的数。
+CONC_MAX = 16
+CONN_BUDGET = 32
+SHUTDOWN_GRACE = 8.0   # P3-2：关机等内核收尾落盘的上限（秒）
+
+
+def _new_nonce() -> str:
+    now = time.time()
+    with _NONCES_LOCK:
+        for k, exp in list(_NONCES.items()):
+            if exp < now:
+                _NONCES.pop(k, None)
+        if len(_NONCES) > NONCE_MAX:                 # 防御性：极端情况下清空重建
+            _NONCES.clear()
+        n = secrets.token_urlsafe(16)
+        _NONCES[n] = now + NONCE_TTL
+        return n
+
+
+def _burn_nonce(n: str) -> bool:
+    """校验并作废（一次性）。"""
+    with _NONCES_LOCK:
+        exp = _NONCES.pop(n, None)
+    return bool(exp) and exp >= time.time()
+
+
 class Task:
     _seq = 0
+    _synced = True      # P1-B：是否已进过 SSE 版本号（首次推送时强制带全量字段）
 
     def __init__(self, url, *, referer=None, cookie=None, name=None, concurrency=0):
         # 注意：id 分配必须在 TASKS_LOCK 内完成（见 add_task），否则并发 add 会撞 id
         Task._seq += 1
         self.id = Task._seq
         self.url, self.referer, self.cookie, self.name = url, referer, cookie, name
+        if not self.name:
+            # P2-A：探测出文件名之前 out_path 是空串，to_dict() 的 basename 也为空
+            # → 卡片标题空白，用户看不出在下什么。先拿 URL 的 basename 顶上。
+            p = os.path.basename(urllib.parse.urlparse(url).path or "")
+            self.name = urllib.parse.unquote(p) or url
         self.requested = concurrency
         self.state = "排队"          # 排队/下载中/完成/失败/已取消
         self.dl: fluxdl.Downloader | None = None
+        # P3-2：关机时要 join 这个线程，等内核把 .fluxdl 收尾落盘再退
+        self.thread: threading.Thread | None = None
         self.snapshot = {"percent": 0.0, "speed": 0, "eta": None, "done": 0,
                          "total": 0, "concurrency": 0}
         self.message = ""
@@ -49,6 +113,7 @@ class Task:
     def start(self):
         self.state = "下载中"
         t = threading.Thread(target=self._run, daemon=True, name=f"fluxdl-task-{self.id}")
+        self.thread = t
         t.start()
         return t
 
@@ -127,9 +192,23 @@ class Task:
         with self._lock:
             snap = dict(self.snapshot)
         return {"id": self.id, "url": self.url, "state": self.state,
-                "name": os.path.basename(self.out_path) or self.name or "",
+                # P2-A：按 out_path → 面板指定名 → URL basename 依次回退
+                "name": (os.path.basename(self.out_path) or self.name
+                         or os.path.basename(urllib.parse.urlparse(self.url).path)
+                         or self.url),
                 "path": self.out_path, "message": self.message,
                 "concurrency": self.requested, **snap}
+
+    def delta(self, prev):
+        """P1-B：只返回与 prev 不同的字段（首次同步 prev 为 None → 全量）。"""
+        cur = self.to_dict()
+        if prev is None:
+            return cur
+        d = {"id": self.id}
+        for k, v in cur.items():
+            if k != "id" and prev.get(k) != v:
+                d[k] = v
+        return d
 
 
 TASKS: dict[int, Task] = {}
@@ -160,17 +239,37 @@ def _prune_tasks():
 
 
 def _pick_queued():
-    """把排队任务填满到 MAX_ACTIVE。
+    """把排队任务填满到 MAX_ACTIVE，且总连接数不超过 CONN_BUDGET。
 
     注意：一次要尽量填满，不能只启动一个 —— 多个任务同时结束时，
     每次只补一个会让队列推进速度落在完成速度后面，形成"半卡死"。
+
+    P2-B：预算是乘法。只卡 MAX_ACTIVE=3 而允许每任务 64 连接 = 192 条 TCP，
+    与"避免把带宽切碎"的注释直接矛盾。这里额外按【连接数】设上限：
+    先算在跑任务已占用的连接（requested=0 表示自适应，按 4 估），
+    剩余预算 >= 4 才允许再起一个任务。
     """
     with TASKS_LOCK:
         active = sum(1 for t in TASKS.values() if t.state == "下载中")
+        used = sum((t.requested or 4) for t in TASKS.values() if t.state == "下载中")
         free = MAX_ACTIVE - active
         if free <= 0:
             return
-        picked = [t for t in TASKS.values() if t.state == "排队"][:free]
+        picked = []
+        for t in TASKS.values():
+            if t.state != "排队":
+                continue
+            need = t.requested or 4
+            if used + need > CONN_BUDGET:
+                if used >= 4:          # 剩余预算连自适应都放不下 → 等下一轮
+                    break
+                need = CONN_BUDGET - used
+            used += need
+            picked.append(t)
+            if len(picked) >= free:
+                break
+        if not picked:
+            return
         for t in picked:
             t.state = "下载中"        # 先在锁内占位，避免并发 _pick_queued 重复启动
     for t in picked:
@@ -203,6 +302,71 @@ def _same_target(t, url, kw):
     if t.url == url:
         return True
     return _target_key(t.url, {"name": t.name}) == _target_key(url, kw)
+
+
+def _meta_done_bytes(meta):
+    return sum(max(0, e - s) for s, e in (meta.get("done") or []))
+
+
+def _scan_resumable() -> int:
+    """P1-C：启动时扫 DOWNLOAD_DIR/*.fluxdl，把残件重建为「可续传」任务。
+
+    背景（实测）：服务重启后面板一片空白，但磁盘上躺着一堆
+    "表观大小 == 完整大小"的文件（内核预分配过）+ 对应的 .fluxdl sidecar，
+    而 sidecar 里 url/size/done 齐全 —— 恢复所需信息 100% 都在磁盘上，
+    用户却只能靠文件名猜哪个下完了。
+
+    这里只重建【元数据】任务（state="可续传"），不自动开下：
+    重启后立刻满速跑起来可能是用户不想要的（他可能刚断网/在计费网络）。
+    点「继续」才真正开跑。
+    """
+    try:
+        names = [n for n in os.listdir(DOWNLOAD_DIR) if n.endswith(".fluxdl")]
+    except OSError:
+        return 0
+    n_ok = 0
+    with TASKS_LOCK:
+        for meta_name in names:
+            meta_path = os.path.join(DOWNLOAD_DIR, meta_name)
+            part = meta_path[:-len(".fluxdl")]
+            try:
+                with open(meta_path, encoding="utf-8") as f:
+                    meta = json.load(f)
+                url = meta.get("url") or ""
+                size = int(meta.get("size") or 0)
+            except (OSError, ValueError, TypeError):
+                continue                     # 坏 sidecar：跳过，不因为一个坏文件起不来
+            if not url.lower().startswith(("http://", "https://")):
+                continue
+            if not os.path.exists(part):
+                continue                     # 文件都没了，续传无从谈起
+            done = _meta_done_bytes(meta)
+            if size and done >= size:
+                continue                     # 已经下满：只是没来得及提升成成品
+            t = Task(url, name=os.path.basename(part))
+            t.state = "可续传"
+            t.done_bytes = done
+            t.total_bytes = size
+            t.meta_path = meta_path
+            t.snapshot.update(done=done, total=size,
+                              percent=round(100.0 * done / size, 2) if size else 0.0)
+            # 「继续」时按剩余量重算并发，别用一个拍出来的数
+            if size and done:
+                t.requested = 0
+            TASKS[t.id] = t
+            n_ok += 1
+    return n_ok
+
+
+def resume_task(t) -> None:
+    """P1-C：把「可续传/已取消/中断」重新排进队列。"""
+    with TASKS_LOCK:
+        if t.state not in ("可续传", "已取消", "中断", "失败"):
+            return
+        t.state = "排队"
+        t.message = ""
+        t.cancelled_before_start = False      # 内核按 sidecar 续传，从缺口继续
+    _pick_queued()
 
 
 def add_task(url, **kw):
@@ -270,6 +434,10 @@ button.primary:hover{opacity:.9;color:#fff}
 .empty{color:var(--dim);text-align:center;padding:40px 0;font-size:13px}
 .msg{color:var(--err);font-size:12px;margin-top:6px;word-break:break-all}
 .solidsub{font-size:12px;color:var(--dim);margin-top:14px}
+.lock{margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+      font-size:12px;color:var(--dim)}
+.lock input{flex:1;min-width:200px;font-size:13px;padding:7px 10px}
+.lock button{padding:7px 14px;font-size:13px}
 </style></head><body>
 <div class="wrap">
   <h1>FluxDL</h1>
@@ -289,13 +457,33 @@ button.primary:hover{opacity:.9;color:#fff}
     <input id="cookie" type="text" placeholder="Cookie（可选）" style="flex:1">
   </div>
   <div class="solidsub" id="dirline"></div>
+  <div class="lock" id="lockbar" hidden>
+    <span>解锁：粘贴控制台打印的 token（只存本机浏览器 localStorage，页面本身不再内联 token）</span>
+    <input id="tok" type="password" placeholder="token" autocomplete="off">
+    <button id="unlock">解锁</button>
+  </div>
 
   <div class="tasks" id="tasks"><div class="empty">暂无任务</div></div>
 </div>
 <script>
-const TOKEN = "__TOKEN__";
 const $ = s => document.querySelector(s);
-document.getElementById('dirline').textContent = "保存到 " + "__DIR__";
+const TOK_KEY = 'fluxdl.token';
+
+// P1-A（Hermes v3）：页面不再内联 token。
+// 原先 "/" 不鉴权就把 token 明文写进 HTML，任何本机进程一条 curl 就能白拿，
+// DNS rebinding 场景下外部页面读一下响应体也能拿到，token 等于没有。
+// 现在第一次打开要手动粘贴一次（控制台启动时会打印），存 localStorage。
+function loadTok(){ try { return localStorage.getItem(TOK_KEY) || ''; } catch(e){ return ''; } }
+function saveTok(v){ try { localStorage.setItem(TOK_KEY, v); } catch(e){} }
+let TOKEN = loadTok();
+
+let dirShown = false;
+function showDir(d){
+  // "__DIR__" 仍然由服务端在【鉴权之后】的 /api/meta 下发，不再进页面模板
+  if(dirShown) return;
+  dirShown = true;
+  document.getElementById('dirline').textContent = '保存到 ' + d;
+}
 
 function fmt(n){n=+(n||0);const u=['B','KB','MB','GB','TB'];let i=0;
   while(n>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(1)+u[i]}
@@ -304,15 +492,29 @@ function eta(s){if(s==null||!isFinite(s))return '--';s=Math.max(0,Math.round(s))
 function badge(st){const m={'下载中':'run','完成':'done','失败':'err'};
   return '<span class="badge '+(m[st]||'')+'">'+st+'</span>'}
 
+// 所有 /api/* 都走这里：统一带 X-Token，403 时弹出解锁条。
+async function api(path, opt){
+  opt = opt || {};
+  opt.headers = Object.assign({'X-Token': TOKEN}, opt.headers || {});
+  const r = await fetch(path, opt);
+  if(r.status === 403){ needToken(); }
+  return r;
+}
+
 async function add(){
   const url = $('#url').value.trim();
   if(!url) return;
   $('#url').value='';
-  await fetch('/api/add',{method:'POST',headers:{'X-Token':TOKEN,
-    'Content-Type':'application/json'},body:JSON.stringify({
+  await api('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
       url, referer:$('#referer').value.trim()||null,
       cookie:$('#cookie').value.trim()||null,
       concurrency:+$('#conc').value})});
+}
+
+// P1-C：把磁盘上还留着 sidecar 的残件恢复成任务（"继续"即可接着下）。
+async function resume(id){
+  await api('/api/resume?id=' + id, {method:'POST'});
 }
 
 // P2-8：差分更新。原先每 800ms 用 innerHTML 全量重建，
@@ -328,6 +530,7 @@ function rowHtml(t){
         <div class="url"></div>
       </div>
       <div class="mini"><span class="badge"></span>
+        <button data-act="resume" hidden>继续</button>
         <button data-act="cancel">取消</button>
       </div>
     </div>
@@ -353,8 +556,10 @@ function makeRow(t){
     speed: el.querySelector('.s-speed'), eta: el.querySelector('.s-eta'),
     conn: el.querySelector('.s-conn'), msg: el.querySelector('.msg'),
     btn: el.querySelector('button[data-act=cancel]'),
+    resume: el.querySelector('button[data-act=resume]'),
   };
   refs.btn.addEventListener('click', () => cancel(t.id));
+  refs.resume.addEventListener('click', () => resume(t.id));
   ROWS.set(t.id, {el, refs});
   return ROWS.get(t.id);
 }
@@ -385,7 +590,7 @@ function render(list){
   }
 }
 
-let lastState = new Map();
+const RESUME_STATES = new Set(['可续传','已取消','中断']);
 function updateRow(row, t){
   const r = row.refs;
   const pct = Math.min(t.percent||0, 100);
@@ -402,6 +607,10 @@ function updateRow(row, t){
   const canCancel = live || t.state === '排队';
   if(r.btn.style.display !== (canCancel ? '' : 'none'))
     r.btn.style.display = canCancel ? '' : 'none';
+  // P1-C：中断/已取消/可续传 的任务给一个「继续」，不必重填 URL
+  const canResume = RESUME_STATES.has(t.state);
+  if(r.resume.style.display !== (canResume ? '' : 'none'))
+    r.resume.style.display = canResume ? '' : 'none';
 
   r.bar.style.width = pct.toFixed(2) + '%';        // 只改宽度，transition 才有效
 
@@ -418,8 +627,7 @@ function updateRow(row, t){
 
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 
-async function cancel(id){await fetch('/api/cancel?id='+id,{method:'POST',
-  headers:{'X-Token':TOKEN}})}
+async function cancel(id){await api('/api/cancel?id='+id,{method:'POST'})}
 
 $('#add').onclick = add;
 $('#url').addEventListener('keydown',e=>{if(e.key==='Enter')add()});
@@ -429,38 +637,122 @@ $('#url').addEventListener('keydown',e=>{if(e.key==='Enter')add()});
 // 服务端 0.7s 推一次，网络上有新数据才动，空闲时不会像轮询那样每隔 800ms
 // 重建一次 HTTP 请求（每个请求一个线程，ThreadingHTTPServer 下尤其浪费）。
 // EventSource 不能自定义 header，所以 token 走 query（仅本机 127.0.0.1 监听）。
-let es = null, sseOk = false;
+let es = null, sseOk = false, started = false;
+let known = new Map();     // id -> task（增量合并后的本地视图）
+let prevActive = [];       // 上一帧的活跃任务 id（用于删除时补一次全量）
 
-function applyList(tasks){ render(tasks); }
+// P1-A：EventSource 不能设请求头，token 只能走 query。
+// 但 SSE 只用于【展示】，所以服务端只接受一次性 nonce（启动时打印，10 分钟过期，
+// 用过即作废），而不是长期的 X-Token —— 这样即使 URL 进了日志/历史记录也不致命。
+let sseStarted = false;
+let pingTimer = null;
+
+function applyList(tasks){ known = new Map(tasks.map(t => [t.id, t])); render(tasks); }
+
+// ---------------------------------------------------------------- P1-B 增量协议
+// 服务端改推 {v, changed, removed}：只有变化的任务进 changed，版本没变就只发 ": ping"。
+// EventSource 对注释行不派发 message 事件，所以前端零感知。
+function applyPatch(p){
+  let structural = false;
+  for(const t of (p.changed || [])){
+    const old = known.get(t.id);
+    // 状态变化会影响排序（活跃在前、终态按 id 倒序）→ 走一次全量 render
+    if(old && old.state !== t.state) structural = true;
+    known.set(t.id, Object.assign(old || {}, t));
+  }
+  for(const id of (p.removed || [])){ if(known.delete(id)) structural = true; }
+
+  const list = [...known.values()];
+  const active = list.filter(t => t.state === '下载中' || t.state === '排队').map(t => t.id);
+  if(structural || String(active) !== String(prevActive)){
+    prevActive = active;
+    render(list);
+  } else {
+    for(const t of (p.changed || [])){
+      const row = ROWS.get(t.id);
+      if(row) updateRow(row, known.get(t.id));
+    }
+  }
+}
 
 function pollFallback(){
   // SSE 不可用（老浏览器 / 代理掐长连接）时退回轮询，功能不能没有。
-  fetch('/api/list',{headers:{'X-Token':TOKEN}})
-    .then(r=>r.json()).then(d=>applyList(d.tasks)).catch(()=>{});
+  api('/api/list').then(r=>r.json()).then(d=>{
+    applyList(d.tasks);
+    if(d.dir) showDir(d.dir);
+  }).catch(()=>{});
 }
 
 function connectSSE(){
   if(!window.EventSource){ setInterval(pollFallback, 800); return; }
-  es = new EventSource('/api/events?token=' + encodeURIComponent(TOKEN));
-  es.onopen = () => { sseOk = true; };
-  es.onmessage = ev => {
-    try { applyList(JSON.parse(ev.data).tasks); } catch(e) {}
-  };
-  es.onerror = () => {
-    // EventSource 自己会重连；连不上时用轮询兜底一次
-    sseOk = false;
-    pollFallback();
-  };
+  if(sseStarted) return;
+  api('/api/nonce', {method:'POST'}).then(r=>{
+    if(!r.ok) throw new Error('nonce');
+    return r.json();
+  }).then(d=>{
+    sseStarted = true;
+    if(d && d.dir) showDir(d.dir);
+    es = new EventSource('/api/events?nonce=' + encodeURIComponent(d.nonce));
+    es.onmessage = ev => {
+      try {
+        const p = JSON.parse(ev.data);
+        if(p.full) applyList(p.full);
+        else applyPatch(p);
+        if(p.dir) showDir(p.dir);
+      } catch(e) {}
+    };
+    es.onerror = () => {
+      // 服务端重启 / nonce 过期：EventSource 会拿旧 URL 不停重连并被 403，
+      // 所以这里主动断开，等解锁后重新握手。
+      sseOk = false;
+      if(es){ es.close(); es = null; }
+      setTimeout(() => { sseStarted = false; if(TOKEN) connectSSE(); }, 1500);
+      pollFallback();
+    };
+  }).catch(()=>{});
 }
-connectSSE();
+
+// ---------------------------------------------------------------- 解锁流程
+function needToken(){
+  $('#lockbar').hidden = false;
+  const i = $('#tok'); if(i) i.focus();
+}
+function boot(){
+  if(!TOKEN){ needToken(); return; }
+  started = true;
+  $('#lockbar').hidden = true;
+  pollFallback();          // 先拿一帧全量（顺带校验 token 是否有效）
+  connectSSE();
+}
+$('#unlock').onclick = () => {
+  const v = $('#tok').value.trim();
+  if(!v) return;
+  TOKEN = v;
+  saveTok(v);
+  if(es){ es.close(); es = null; }
+  sseStarted = false;
+  boot();
+};
+$('#tok').addEventListener('keydown', e => { if(e.key === 'Enter') $('#unlock').click(); });
+boot();
 </script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "FluxDL"
+    timeout = 30            # P2-C：不给 None。否则半开连接能被无限期挂住
 
     def log_message(self, fmt, *args):      # 静音，避免刷屏
         pass
+
+    def _host_ok(self):
+        """P1-A①：Host 头白名单。
+
+        只监听 127.0.0.1 时，正常访问的 Host 必然是 127.0.0.1:PORT /
+        localhost:PORT / [::1]:PORT。DNS rebinding 的攻击页面把 evil.com
+        解析到 127.0.0.1，但浏览器发出的 Host 仍是 evil.com:PORT —— 一条就能挡。
+        """
+        return (self.headers.get("Host") or "") in ALLOWED_HOSTS
 
     def _auth_ok(self, allow_query=False):
         # P2-8：用 hmac.compare_digest 做常量时间比较。
@@ -469,13 +761,13 @@ class Handler(BaseHTTPRequestHandler):
         got = self.headers.get("X-Token") or ""
         if got:
             return hmac.compare_digest(got, TOKEN)
-        # P2-5：EventSource 无法自定义请求头，SSE 只能用 query 传 token。
-        # 仅对本机 127.0.0.1 监听的用途放开；token 会进访问日志，
-        # 所以这里把该路径的日志静音（见 log_message）。
+        # P2-5：EventSource 无法自定义请求头，SSE 只能用 query 传凭证。
+        # P1-A②：这里认的是【一次性 nonce】，不是长期 token ——
+        # URL 会进浏览器历史/代理日志，长期凭证不该出现在那里。
         if allow_query:
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            got = (q.get("token") or [""])[0]
-            return hmac.compare_digest(got, TOKEN)
+            got = (q.get("nonce") or [""])[0]
+            return bool(got) and _burn_nonce(got)
         return False
 
     @staticmethod
@@ -518,43 +810,128 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
+        # P1-A①：所有请求（含静态页）先过 Host 白名单。
+        if not self._host_ok():
+            return self._json({"error": "Host 不被允许"}, 403)
         if u.path in ("/", "/index.html"):
-            html = PAGE.replace("__TOKEN__", TOKEN).replace("__DIR__", DOWNLOAD_DIR)
-            return self._html(html)
+            # P1-A②：页面是【静态】的 —— 不再内联 token，也不再内联下载目录。
+            # 原先 curl 一条无鉴权 GET / 就能读到 TOKEN=...，token 形同虚设；
+            # 目录同理（泄露本机路径/用户名）。
+            return self._html(PAGE)
         # SSE 必须放在通用 token 校验之前：EventSource 无法自定义请求头，
-        # token 只能走 query，而通用 _auth_ok() 只认 X-Token 头 ——
-        # 若先走通用校验，带 ?token= 的 SSE 请求会被直接 403，
-        # 前端 onerror 又去轮询，SSE 就永远接不上（等于 P2-5 没修）。
+        # 凭证只能走 query（nonce），而通用 _auth_ok() 只认 X-Token 头。
         if u.path == "/api/events":           # SSE 实时推送
             if not self._auth_ok(allow_query=True):
                 return self._json({"error": "需要 token"}, 403)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            try:
-                while True:
-                    with TASKS_LOCK:
-                        ts = [t.to_dict() for t in sorted(TASKS.values(), key=lambda x: -x.id)]
-                    self.wfile.write(f"data: {json.dumps({'tasks': ts}, ensure_ascii=False)}\n\n"
-                                     .encode())
-                    self.wfile.flush()
-                    time.sleep(0.7)
-            except Exception:
-                return
+            return self._sse()
         if not self._auth_ok():
             return self._json({"error": "需要 token"}, 403)
         if u.path == "/api/list":
             with TASKS_LOCK:
                 ts = sorted(TASKS.values(), key=lambda t: -t.id)
-            return self._json({"tasks": [t.to_dict() for t in ts]})
+            return self._json({"tasks": [t.to_dict() for t in ts], "dir": DOWNLOAD_DIR})
+        if u.path == "/api/meta":
+            return self._json({"dir": DOWNLOAD_DIR, "max_active": MAX_ACTIVE,
+                               "conc_max": CONC_MAX, "budget": CONN_BUDGET})
         return self._json({"error": "not found"}, 404)
+
+    # ------------------------------------------------------------------ SSE
+    def _sse(self):
+        """P1-B：增量协议 + P2-C：客户端上限与 socket 超时。
+
+        原实现每 0.7s 在锁内把【全部任务】to_dict() 一遍再 json.dumps 全量下发：
+        200 个任务时实测 66,211 B/次（1.43 Hz → 92.5 KB/s/客户端），
+        且 O(客户端数 × 任务数) 的 GIL 争用。开 3 个标签页就是 3 份。
+
+        新协议：
+          {"v": 版本号, "changed": [变化任务], "removed": [id]}
+          - 版本没变 → 只写一行 ": ping"（EventSource 忽略注释行）
+          - 变化字段做 delta：不变字段（url/path…）不再每帧重发
+          - 新连接第一帧带 "full": [...]，前端可直接重建视图
+        """
+        global _SSE_ACTIVE
+        with _SSE_LOCK:
+            if _SSE_ACTIVE >= SSE_MAX:
+                return self._json({"error": f"SSE 客户端已达上限 {SSE_MAX}"}, 503)
+            _SSE_ACTIVE += 1
+        try:
+            # P2-C：settimeout 让"客户端拔网线"在 write 时立刻抛错，
+            # 而不是靠下一次 flush 才发现；也让 idle 客户端最终能回收。
+            try:
+                self.connection.settimeout(10)
+            except OSError:
+                pass
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+            # 每个连接各自维护"上次发出去的视图"，只推差异
+            sent: dict[int, dict] = {}
+            first = True
+            while True:
+                with TASKS_LOCK:
+                    cur = {t.id: t.to_dict() for t in TASKS.values()}
+                changed = [d for tid, d in cur.items()
+                           if d != sent.get(tid)]
+                removed = [tid for tid in sent if tid not in cur]
+                if first:
+                    payload = {"full": [cur[k] for k in sorted(cur, reverse=True)],
+                               "dir": DOWNLOAD_DIR}
+                    first = False
+                elif changed or removed:
+                    # delta：只带变化字段（前端 Object.assign 合并）
+                    body = []
+                    for d in changed:
+                        old = sent.get(d["id"])
+                        body.append(d if old is None else
+                                    {k: v for k, v in d.items()
+                                     if k == "id" or old.get(k) != v})
+                    payload = {"changed": body, "removed": removed}
+                else:
+                    self.wfile.write(b": ping\n\n")        # 心跳，不算事件
+                    self.wfile.flush()
+                    time.sleep(SSE_INTERVAL)
+                    continue
+                sent = cur
+                self.wfile.write(("data: " + json.dumps(payload, ensure_ascii=False)
+                                  + "\n\n").encode())
+                self.wfile.flush()
+                time.sleep(SSE_INTERVAL)
+        except Exception:
+            return
+        finally:
+            with _SSE_LOCK:
+                _SSE_ACTIVE -= 1
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if not self._host_ok():
+            return self._json({"error": "Host 不被允许"}, 403)
+        if u.path == "/api/nonce":
+            # P1-A②：SSE 专用的一次性凭证。必须先有合法 X-Token 才发得出来，
+            # 所以 rebinding 页面拿不到（它连 X-Token 都写不进跨域请求头）。
+            if not self._auth_ok():
+                return self._json({"error": "需要 token"}, 403)
+            return self._json({"nonce": _new_nonce(), "dir": DOWNLOAD_DIR,
+                               "ttl": NONCE_TTL})
         if not self._auth_ok():
             return self._json({"error": "需要 token"}, 403)
+        if u.path == "/api/resume":           # P1-C：继续一个可续传任务
+            q = urllib.parse.parse_qs(u.query)
+            tid = self._int_param((q.get("id") or ["0"])[0], default=0, lo=0)
+            if tid is None:
+                return self._json({"error": "id 必须是正整数"}, 400)
+            with TASKS_LOCK:
+                t = TASKS.get(tid)
+            if not t:
+                return self._json({"error": "任务不存在"}, 404)
+            if t.state not in ("可续传", "已取消", "中断", "失败"):
+                return self._json({"error": f"当前状态 {t.state} 不能继续"}, 400)
+            resume_task(t)
+            return self._json({"ok": True})
         if u.path == "/api/cancel":
             q = urllib.parse.parse_qs(u.query)
             tid = self._int_param((q.get("id") or ["0"])[0], default=0, lo=0)
@@ -573,9 +950,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "非法 JSON"}, 400)
             if not isinstance(data, dict):
                 return self._json({"error": "请求体必须是 JSON 对象"}, 400)
-            conc = self._int_param(data.get("concurrency"), default=0, lo=0, hi=64)
+            conc = self._int_param(data.get("concurrency"), default=0, lo=0, hi=CONC_MAX)
             if conc is None:
-                return self._json({"error": "concurrency 必须是 0-64 的整数"}, 400)
+                return self._json(
+                    {"error": f"concurrency 必须是 0-{CONC_MAX} 的整数"}, 400)
             url = (data.get("url") or "").strip()
             if not url.lower().startswith(("http://", "https://")):
                 return self._json({"error": "只支持 http/https"}, 400)
@@ -587,17 +965,91 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"error": "not found"}, 404)
 
 
+def _shutdown(srv, signame="SIGINT"):
+    """P3：统一收尾。
+
+    原先只捕 KeyboardInterrupt —— systemd / docker / kill 默认发的是 SIGTERM，
+    进程直接死，日志里连 "bye" 都没有，用户看到的是"服务莫名消失"。
+    数据本身是安全的（_atomic_json 落盘），但体验很粗糙：没人告诉用户断点还在。
+
+    P3-2（本轮实测发现）：只调 t.cancel() 然后立刻 SystemExit 是【假收尾】。
+    cancel() 只是 stop_flag.set() 就返回，下载线程还在 _worker 里；主线程马上
+    raise SystemExit 把进程带走（线程是 daemon），内核那条
+    "_run_ranged 循环退出 → _flush_meta()" 的路径根本没机会执行 →
+    .fluxdl 一个字节都没写。而日志照样打印"断点已保存"，说谎。
+    实测证据：SIGTERM 后 dl 目录为空，重启扫到 0 个可续传任务。
+    正确做法：cancel 之后 join 线程，给内核留出收尾时间。
+    """
+    stopped = saved = 0
+    with TASKS_LOCK:
+        live = [t for t in TASKS.values() if t.state in ("排队", "下载中")]
+    for t in live:
+        try:
+            t.cancel()
+            stopped += 1
+        except Exception:
+            pass
+
+    # 给内核时间把最后一帧 pending 区间合并进 .fluxdl 并原子落盘
+    deadline = time.time() + SHUTDOWN_GRACE
+    for t in live:
+        th = getattr(t, "thread", None)
+        if th is None or not th.is_alive():
+            continue
+        th.join(max(0.0, deadline - time.time()))
+
+    for t in live:
+        th = getattr(t, "thread", None)
+        if th is not None and th.is_alive():
+            continue                      # 超时未收尾 —— 下面单独告警
+        mp = getattr(t, "meta_path", "") or (
+            (getattr(t.dl, "meta_path", "") if t.dl else ""))
+        if mp and os.path.exists(mp):
+            saved += 1
+
+    if stopped:
+        if saved >= stopped:
+            print(f"已停止 {stopped} 个任务，断点已保存（.fluxdl），"
+                  f"重跑同命令/点「继续」可续传")
+        elif saved:
+            print(f"已停止 {stopped} 个任务，其中 {saved} 个断点已保存；"
+                  f"{stopped - saved} 个未完成收尾（该任务需重新下载）")
+        else:
+            print(f"已停止 {stopped} 个任务，但断点未能落盘"
+                  f"（sidecar 缺失，续传不可用）")
+    else:
+        print("无进行中的任务")
+    print(f"bye ({signame})")
+    try:
+        srv.shutdown()
+    except Exception:
+        pass
+
+
 def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    srv.daemon_threads = True
     print(f"FluxDL 面板: http://{HOST}:{PORT}/")
     print(f"token: {TOKEN}")
     print(f"目录: {DOWNLOAD_DIR}")
+    n = _scan_resumable()
+    if n:
+        print(f"发现 {n} 个可续传任务（磁盘上的 .fluxdl），面板里点「继续」即可")
+
+    def _on_signal(signum, frame):
+        _shutdown(srv, signal.Signals(signum).name)
+        raise SystemExit(0)
+
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(s, _on_signal)
+        except (ValueError, OSError):
+            pass          # 非主线程 / 不支持的平台：忽略，别因此起不来
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nbye")
-        srv.shutdown()
+        _shutdown(srv, "SIGINT")
 
 
 if __name__ == "__main__":

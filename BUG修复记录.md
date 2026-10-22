@@ -583,3 +583,169 @@ OK
 | `TestP2TaskHistoryPruned` | P2-4 淘汰终态、保留活跃 |
 
 全部 16 个用例通过；`scripts/check_stdlib_only.py` 零依赖校验通过。
+
+---
+
+# 第四批（Hermes 复审 v3）：断点续做中实测发现的两个真 bug
+
+> 场景：接续上一轮被中断的 P1-A/B/C + P2-A/B/C + P3 修复，跑端到端自测。
+> 前两个 bug 都是**端到端跑起来才暴露**的，纯读代码与单元测试都发现不了 ——
+> 因为它们只在"真实中断 + 真实服务器"的组合下触发。
+
+| # | Bug | 严重度 | 后果 | 状态 |
+|---|---|---|---|---|
+| 5 | **SIGTERM 收尾是假的**：cancel 后立刻 SystemExit，内核来不及落盘 sidecar | **高** | 日志说"断点已保存"，实际 `.fluxdl` 零字节 → 重启无可续传任务 | ✅ 已修 |
+| 6 | **`probe` 信任 HEAD 的错误页**（501 不抛异常） | **致命** | 支持 Range 的服务器被误判为"不支持" → 静默降级为不可续传，断点全丢 | ✅ 已修 |
+
+---
+
+## Bug 5：SIGTERM 收尾"假装"保存了断点
+
+### 现象
+
+P3 补上了 SIGTERM 处理，日志确实打印了：
+
+```
+已停止 1 个任务，断点已保存（.fluxdl），重跑同命令/点「继续」可续传
+bye (SIGTERM)
+```
+
+但紧接着的断言打脸：
+
+```
+  FAIL 断点 sidecar 已落盘  []
+```
+
+下载目录是**空的**，重启后 `_scan_resumable()` 扫到 **0 个**可续传任务。
+
+### 根因
+
+```python
+def _shutdown(srv, signame="SIGINT"):
+    for t in live:
+        t.cancel()          # ← 只是 stop_flag.set()，立即返回
+        stopped += 1
+    print(f"已停止 {stopped} 个任务，断点已保存（.fluxdl）…")   # ← 谎报
+    srv.shutdown()
+
+def _on_signal(signum, frame):
+    _shutdown(...)
+    raise SystemExit(0)     # ← 主线程立刻退出，daemon 线程被一起带走
+```
+
+内核的落盘发生在 `_run_ranged()` 的**收尾段**：
+
+```python
+while any(t.is_alive() for t in ths): ...
+for t in ths: t.join()
+self._flush_meta()          # ← 真正的 .fluxdl 写入在这里
+```
+
+`cancel()` 只是置位，下载线程还在 `_worker` 里；主线程 `raise SystemExit`
+把整个进程（含所有 daemon 线程）立即终结，`_flush_meta()` **一行都没执行**。
+所以断点从来没被写过，日志却在报"已保存"——比不报更坏。
+
+### 修复
+
+1. `Task.start()` 保存线程句柄 `self.thread`；
+2. `_shutdown()` 在 cancel 之后 **join 每个下载线程**，上限 `SHUTDOWN_GRACE = 8s`；
+3. join 完**实际检查 sidecar 是否存在**，按真实结果输出三种日志：
+   - 全部落盘 → "断点已保存"
+   - 部分落盘 → "其中 N 个已保存，M 个未收尾"
+   - 全没落盘 → "但断点未能落盘（sidecar 缺失，续传不可用）"
+
+### 验证（`tests/e2e_resume.py`）
+
+```
+== P1-C① 下到一半被 SIGTERM ==
+  PASS 中断前确实下了一部分  done=2621440
+  PASS P3：SIGTERM 有收尾日志  '已停止 1 个任务，断点已保存（.fluxdl）…bye (SIGTERM)'
+  PASS 断点 sidecar 已落盘  ['src.bin.fluxdl']
+== P1-C② 重启后扫出「可续传」任务 ==
+  PASS 状态是「可续传」/ 沿用已下字节数 done=2621440 / 有 name
+== P1-C③ 点「继续」==
+  PASS 续传后状态=完成 / 成品存在 / sha256 与源一致
+  PASS 续传请求起点接近已下字节  later=[3145728, 3670016, 2883584, 2621440, …]
+```
+
+---
+
+## Bug 6：`probe` 信任 HEAD 的错误页 → 能续传的地址被判成不能续传（最隐蔽）
+
+### 现象
+
+对一个**完全支持 Range** 的服务器（GET 带 `Range: bytes=0-0` 返回 206 +
+`Content-Range` + `Accept-Ranges: bytes`），`probe` 却得出：
+
+```
+PROBE ranges= False size= 482 note= 不支持 Range：单连接下载，无法断点续传
+```
+
+`size=482` 是**HTML 错误页的长度**，不是文件的 8 MB。
+
+### 根因（比评审 P1-3 描述的更严重）
+
+评审写的是"HEAD 不被支持时用单字节 GET 探测"，看起来代码已经处理了。
+实际上 `except` 分支**根本进不去**：
+
+```python
+conn, r, final = pool.open(url, method="HEAD")   # HEAD 501 —— 不抛异常！
+info["ranges"] = (h.get("Accept-Ranges","") or "").lower() == "bytes"  # 错误页没这个头 → False
+cl = h.get("Content-Length")                     # 错误页的 482
+if cl and cl.isdigit(): info["size"] = int(cl)   # → size=482
+```
+
+`HTTPError` 只在 `urlopen` 层面抛；`pool.open()` 拿到底层连接后，
+**4xx/5xx 响应是正常返回的**（它只把状态码放在 `r.status` 里）。
+于是 501 错误页被当成真实响应处理，"HEAD 回退"逻辑成了死代码。
+
+### 后果链（真·致命）
+
+```
+probe: ranges=False
+  → run(): if not self.info.get("ranges") or not self.total: return self._run_single()
+  → _run_single() 的注释写着「无 Range 支持：单连接顺序下载，明确不做续传」
+  → 不建 .fluxdl sidecar，产物是 xxx.part
+  → 中途取消/断网/关机：断点全丢，只能从头再下
+```
+
+用户看到"这个地址不支持续传"，而服务器明明支持。**且没有任何报错。**
+
+### 修复（`fluxdl.py` `probe()`）
+
+1. **HEAD 必须 2xx 才可信**，否则主动抛 `HTTPError` 走进 GET 回退分支；
+2. GET 回退分支不再只认 `Content-Range`：`206` 本身或
+   `Accept-Ranges: bytes` 任一成立即判为支持 Range；
+3. `size` 只从 `200` 全量响应的 `Content-Length` 取
+   （206 的 `Content-Length` 只是分片长度，不能当总大小）。
+
+### 验证
+
+修复前 / 后（同一台服务器，只有 HEAD 返回 501）：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| `probe.ranges` | `False` | **`True`** |
+| `probe.size` | `482`（错误页） | **`8388608`** |
+| 走的路径 | `_run_single()`（不可续传） | **`_run_ranged()`** |
+| 中断后 sidecar | 无 | **`src.bin.fluxdl`，done=2621440** |
+| 续传 | 不可能 | **`resumed_from=2.5MB`，sha256 一致** |
+| 完成后 sidecar | — | **自动清理** |
+
+### 回归用例（已固化，不靠 e2e）
+
+`tests/test_regression.py::TestProbeNoHead`
+
+- `test_probe_detects_range_when_head_501`：ranges 必须 True、size 必须是真实大小
+- `test_resume_sidecar_created_when_head_501`：必须走带 sidecar 的路径
+
+---
+
+## 本轮全套验证
+
+| 测试 | 结果 |
+|---|---|
+| `tests/test_regression.py`（18 项，含本轮新增 2 项） | **18/18 OK** |
+| `tests/e2e_security.py`（P1-A：Host 白名单 / 不内联 token / nonce 一次性 / SIGTERM） | **16/16 通过** |
+| `tests/e2e_resume.py`（P1-C：中断→重启→续传→sha256） | **14/14 全部通过** |
+| `tests/e2e_budget.py`（P2-B：conc_max=16 / budget=32） | **5/5 全部通过** |
