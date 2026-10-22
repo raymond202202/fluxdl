@@ -19,7 +19,27 @@ import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PORT = 8899
+
+
+def _free_port(start=8899, tries=200):
+    """挑一个真正空闲的端口。
+
+    坑（真实踩过两次）：写死 8899/8901 时，上一次跑挂的进程或环境里别的
+    测试服务器会占着端口，服务起不来 → 后面的断言全都失败在"连不上/日志是
+    错误栈"上，看起来像产品 bug，其实是测试环境脏。宁可多试几个端口。
+    """
+    for off in range(tries):
+        port = start + off
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    raise RuntimeError("找不到空闲端口")
+
+
+PORT = _free_port()
 BASE = f"http://127.0.0.1:{PORT}"
 TOK = "testtok"
 fails = []
@@ -140,16 +160,67 @@ def main():
                     body=json.dumps({"url": "http://127.0.0.1:1/none.bin"}).encode())
         check("/api/add 可用（返回 task id）", st == 200 and b"id" in b, f"status={st}")
     finally:
+        # ---- D1：SIGTERM 必须【自己】退出。禁止 SIGKILL 收尾 ----
+        # 上一版这里只检查日志文本，超时就直接 p.kill()，于是
+        # "shutdown() 在主线程自等死锁"被彻底掩盖（进程挂死 20s+ 仍判定 PASS）。
+        # 现在断言退出的【事实】与【耗时】。
+        t0 = time.time()
         p.send_signal(signal.SIGTERM)
+        exited = True
         try:
-            out, _ = p.communicate(timeout=10)
+            rc = p.wait(timeout=10)
+            elapsed = time.time() - t0
         except subprocess.TimeoutExpired:
-            p.kill()
-            out, _ = p.communicate()
+            exited = False
+            rc = None
+            elapsed = time.time() - t0
+            p.kill()                      # 仅在断言失败后清理，不再是"正常收尾"
+            p.wait()
+        out = ""
+        try:
+            if p.stdout:
+                out = p.stdout.read() or ""
+        except Exception:
+            pass
         print("---- 服务端输出 ----")
-        print((out or "").strip()[:800])
+        print(out.strip()[:800])
         print("--------------------")
-        print("P3：SIGTERM 后进程应已退出 →", "OK" if p.poll() is not None else "仍在运行")
+        check("D1：SIGTERM 后 10s 内自行退出", exited, f"elapsed={elapsed:.2f}s")
+        check("D1：SIGTERM 退出码 == 0", rc == 0, f"rc={rc}")
+        print(f"    实测退出耗时 {elapsed:.2f}s")
+
+        # ---- D2：文件重定向 + 不设 PYTHONUNBUFFERED，1s 内日志必须有 token ----
+        print("== D2 非 tty 日志立即可见 ==")
+        dl2 = tempfile.mkdtemp(prefix="fluxdl_d2_")
+        logf = os.path.join(dl2, "srv.log")
+        env2 = dict(os.environ, FLUXDL_TOKEN="tokd2", FLUXDL_PORT=str(_free_port(PORT + 1)),
+                    FLUXDL_DIR=dl2)
+        env2.pop("PYTHONUNBUFFERED", None)      # 关键：模拟 systemd/docker/重定向
+        with open(logf, "w") as fh:
+            p2 = subprocess.Popen([sys.executable, "fluxdl_server.py"], cwd=ROOT,
+                                  env=env2, stdout=fh, stderr=subprocess.STDOUT)
+        try:
+            got = ""
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                with open(logf) as f:
+                    got = f.read()
+                if "token:" in got:
+                    break
+                time.sleep(0.05)
+            ok2 = "token:" in got
+            check("D2：启动 1s 内日志已含 token:", ok2, f"len={len(got)}")
+            if not ok2:
+                print("     日志实际内容:", repr(got[:300]))
+        finally:
+            p2.send_signal(signal.SIGTERM)
+            try:
+                p2.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p2.kill()
+                p2.wait()
+            shutil.rmtree(dl2, ignore_errors=True)
+
         shutil.rmtree(dl, ignore_errors=True)
 
     print("\n结果: %d 项失败" % len(fails) if fails else "\n全部通过")
