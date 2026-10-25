@@ -214,7 +214,13 @@ class TestResumeBoundToContent(_ResumeBase):
         self.assertIn("源已变更", msg)
         self.assertIn(ETAG_A, msg, "报错要给出旧指纹")
         self.assertIn(ETAG_B, msg, "报错要给出新指纹")
-        self.assertIn("--force-restart", msg, "报错要给出下一步")
+        # R2-1：旧断点在报错的同时就被真的丢弃了，所以"下一步"是**重跑普通命令**，
+        # 不再是"加 --force-restart"。这里断言的是"给了可行下一步"，而不是某个开关名
+        # —— 否则修好缺陷本身会把这条用例判红（改前它就是靠 --force-restart 硬撑的）。
+        self.assertIn("重跑同一条命令", msg, "报错要给出下一步")
+        self.assertIn("旧断点已丢弃", msg, "报错要说明检查点已被真正作废")
+        self.assertNotIn("重跑同命令可续传", msg,
+                         "不能说'断点已作废'又说'重跑同命令可续传'（自相矛盾）")
 
     def test_C_force_restart_recovers(self):
         """加 --force-restart → 退出 0，成品 == 新源。"""

@@ -432,6 +432,16 @@ class Downloader:
         self.if_range = None          # 续传时给 worker 用的 If-Range / If-Unmodified-Since
         self._worker_fp_violation = False   # 有 worker 撞上「源已变更」
         self.resumed_from_fp = None   # 本次续传基于的旧指纹（诊断/告警用）
+        # R2-1：确认旧断点不可用后，是否已经真的把它丢掉了。
+        # 用它来收尾（而不是让 CLI 猜），因为「作废」这句话和「重跑可续传」
+        # 同时出现就是自相矛盾 —— 谁作废谁负责把话说完整。
+        self.checkpoint_discarded = False
+        # R2-1：本 worker（线程内可见）是否已经下到过真实 206 数据。
+        # 用线程局部而不是实例属性：并发下每个 worker 的"首块"各自独立。
+        self._tls = threading.local()
+        # R2-1：撞过一次源已变更后，本轮所有 worker 都不再带 If-Range，
+        # 避免把"已下好的新数据"当成"作废断点"重复丢弃。
+        self._if_range_off = threading.Event()
 
         self.info, self.total = {}, 0
         self.finished_bytes = self.fetched = 0
@@ -478,21 +488,42 @@ class Downloader:
                     pool_ranges.pop(0)
                 end = a + take - 1
             got = 0
+            # R2-1：If-Range 只在「还没拿到任何 206 数据」的请求上带。
+            # 一旦本 worker 已有块真实落地，必须放行（见下面 502 行处的前提断言）：
+            # 若首个 206 之后源被换掉，后续每个块都会撞 200。此时旧代码会把
+            # 「判定源已变更 + 丢弃检查点」重复执行 N 次 —— 第一次丢的是旧断点，
+            # 第二次起丢的是**本轮已下好的新数据**，用户重跑等于白下一遍。
+            sent_ir = self._if_range_enabled() and got == 0
             try:
-                extra = dict([self.if_range]) if self.if_range else None
+                extra = dict([self.if_range]) if sent_ir else None
                 conn, r, _ = self.pool.open(self.url, rng=(a, end), extra=extra)
                 if r.status == 200:
                     # P0-1：带了 If-Range 却回 200 == 服务端明确表态"内容不是那一份"。
                     # 这时候写进去的每个字节都会和旧数据错位，必须立刻停手。
-                    if self.if_range:
+                    # 分支顺序很重要：先判「带了 If-Range 且本块尚无数据」（真正的
+                    # 源变更现场），再判「带了 If-Range 但已有 206 数据落地」。
+                    if sent_ir and got == 0:
                         self._worker_fp_violation = True
+                        # R2-1：光说"断点已作废"不算数，必须真把检查点丢掉，
+                        # 否则下一轮还会捡起同一个断点、报同一句话，永远出不来。
+                        self._discard_stale_checkpoint()
                         raise DownloadError(
-                            "源已变更（%s 不再匹配），断点已作废；"
-                            "加 --force-restart 可丢弃检查点重下"
+                            "源已变更（%s 不再匹配），旧断点已丢弃；"
+                            "重跑同一条命令即可从头下载新内容"
                             % self.if_range[1])
+                    if self.if_range:
+                        # R2-1：只有本 worker 已经下到过真实数据，才可能是这个分支
+                        # （上一分支已拦下"本块尚无数据"）。响应变 200 说明源确实换了，
+                        # 停止写是对的；但**不能说"断点已作废"** —— 已经落地的那部分
+                        # 是 206 完整校验过的旧内容，丢掉它等于白下一遍。
+                        # 此时 meta 保持原样（本轮进度照常落盘），重跑能接着下。
+                        raise DownloadError(
+                            "源已变更（%s 不再匹配），已下好的部分仍然有效；"
+                            "稍后重跑同一条命令可继续" % self.if_range[1])
                     raise DownloadError("服务端忽略 Range（返回 200），数据会错位")
                 if r.status != 206:
                     raise DownloadError(f"HTTP {r.status}")
+                # 第一块真实数据到手 → 关闭后续请求的 If-Range（见 sent_ir 的说明）
                 while got < take and not self.stop_flag.is_set():
                     buf = r.read(min(65536, take - got))
                     if not buf:
@@ -510,6 +541,9 @@ class Downloader:
             except Exception as e:
                 if getattr(self, "_worker_fp_violation", False):
                     # 源已变更：不回收区间、不再重试，直接把整轮下载判死。
+                    # R2-1：本块已写的字节不能进 meta（它们与新内容错位）。
+                    # 统一由 _flush_meta 依据 checkpoint_discarded 丢弃 pend，
+                    # 这里不需要额外记账 —— 记了反而容易和"已作废"状态打架。
                     self.error = str(e)
                     self.stop_flag.set()
                     return
@@ -539,10 +573,23 @@ class Downloader:
         with self.lock:
             pend, self._pending = self._pending, []
         with self.meta_lock:
+            # R2-1：本轮已经确认「源已变更、断点作废」之后，这批 pend 属于
+            # 与新内容错位的旧数据，绝不能以"已完成区间"的名义写回 meta ——
+            # 否则 _discard_stale_checkpoint 刚清空的 done 会被 _merge 合并回来，
+            # done 又变回非空，等于把缺陷原样复现一遍。
+            # （pend 先取走再判状态，所以已经排队的那批也一并丢掉。）
+            if self.checkpoint_discarded:
+                pend = []
             for a, b in pend:
                 _merge(self.meta, a, b)
             # P0-1：指纹随 meta 一起落盘，重跑时才有东西可比。
             fp = _fp_of(self.info or {})
+            if self.checkpoint_discarded:
+                # 已作废：指纹保持 _discard_stale_checkpoint 写下的新源值，
+                # 不再用本轮 info 覆盖（本轮 info 可能是变更前探测到的旧值，
+                # 覆盖回去会让 meta 变成"旧指纹 + 空进度"，下次又白跑一次预检）。
+                fp = {"etag": self.meta.get("etag"),
+                      "last_modified": self.meta.get("last_modified")}
             if fp.get("etag"):
                 self.meta["etag"] = fp["etag"]
             if fp.get("last_modified"):
@@ -655,8 +702,17 @@ class Downloader:
         if existed_same_size and not trusted_resume:
             # P0-1：把「为什么重下」说清楚。旧版 meta 只有 v4，没有指纹可比，
             # 静默沿用它就等于把这轮的混合留给下一轮 —— 所以宁可重下。
-            why = ("旧版检查点没有内容指纹（v4 → v5），无法确认服务端文件未变"
-                   if had_meta else "缺少有效续传元数据")
+            # R2-1：这里原先只判断「meta 在不在」，于是上一轮刚被 R2-1 作废过的
+            # 检查点（v5、done 清空、指纹已是新源）会被报成"旧版 v4 没指纹" ——
+            # 磁盘状态和文案直接打架，用户会以为自己的 meta 被谁改坏了。
+            # 判据改成「有没有指纹」，与 _load_meta 里实际的 v5 门槛一致。
+            if had_meta and self.meta.get("etag"):
+                why = ("检查点已没有可续传的区间（上一轮确认源已变更并作废了断点），"
+                       "只剩 %s 的指纹" % _fp_desc(self.meta))
+            elif had_meta:
+                why = "旧版检查点没有内容指纹（v4 → v5），无法确认服务端文件未变"
+            else:
+                why = "缺少有效续传元数据"
             print(f"警告: {self.path} 已存在且大小匹配，但{why} "
                   f"→ 视为未完成，从头下载", file=sys.stderr)
         fresh = not trusted_resume
@@ -718,6 +774,11 @@ class Downloader:
                         self.stop_flag.set()
                 for t in ths:
                     t.join()
+                # R2-1：任何一个 worker 撞上"源已变更"后，本轮不再发任何带
+                # If-Range 的请求 —— 否则其它 worker 会各自撞一次 200，
+                # 每撞一次就把已下好的进度当"作废断点"清一遍。
+                if self._worker_fp_violation:
+                    self._if_range_off.set()
                 self._flush_meta()
                 self.on_progress(self.progress())
         finally:
@@ -766,6 +827,59 @@ class Downloader:
                 raise DownloadError("--force-restart 无法删除 %s: %s" % (p, e))
         if self.verbose and removed:
             print("已丢弃检查点: %s" % ", ".join(removed), file=sys.stderr)
+
+    def _if_range_enabled(self) -> bool:
+        """R2-1：本轮是否还允许带 If-Range。
+
+        一旦有 worker 确认「源已变更并丢弃了断点」，其余 worker 继续带
+        If-Range 只会在服务端（或本来就不支持 If-Range 的实现）上再撞一次
+        200，而每次撞都会把刚刚重新累计的进度当"作废断点"清掉 —— 越下越空。
+        关掉之后行为退化到"普通 Range 请求"，等到重跑再由前置校验兜底。
+        """
+        return bool(self.if_range) and not self._if_range_off.is_set()
+
+    def _discard_stale_checkpoint(self):
+        """源已变更 → 真把作废的检查点在磁盘上清掉（R2-1）。
+
+        为什么选「重置 meta 并改写新指纹」而不是「删掉 meta 文件」：
+          - 删 meta 只解决"下一轮不再续传"，却把"本地这份残片对应的是新源"
+            这条信息也一起丢了，紧接着那一轮只能从零重下（虽然正确，但白丢
+            一次已知信息）；
+          - 这里把 done 清空、换上本轮的新指纹、立刻落盘，等于原子地把检查点
+            改造成"新任务的第 0 字节"。下一轮以 v5 + 新 ETag 正常续传，
+            不会再触发一次源已变更；而且只删一个区间列表、不做文件 IO，
+            在 worker 线程里也能安全调用（_flush_meta 走的是同一把 meta_lock）。
+
+        注意：区间数据不再复用，但 .fluxdl 里"已确认作废"是自洽的 ——
+        done == [] 表示一个字节都没确认，与磁盘上那份预分配的半成品不矛盾
+        （续传的信任条件本来就是 had_meta and done 非空）。
+        """
+        if self.checkpoint_discarded:
+            return
+        fp = _fp_of(self.info or {})
+        with self.meta_lock:
+            done = self.meta.get("done") or []
+            dropped = sum(e - s for s, e in done)
+            self.meta["done"] = []
+            self.meta["v"] = META_V
+            # 指纹换成新源：即便不重跑，meta 里也不会再留着"旧指纹 + 有进度"
+            # 这种自相矛盾的状态。
+            self.meta["etag"] = fp.get("etag")
+            self.meta["last_modified"] = fp.get("last_modified")
+            self.meta["head_sha"] = None      # 旧源的头 sha 对新内容无意义
+            try:
+                _atomic_json(self.meta_path, self.meta)
+            except OSError as e:
+                # 落盘失败不能让"报源已变更"这件事变成另一个异常盖掉；
+                # 但必须把真相说出来 —— 此时下一轮仍可能捡到旧断点。
+                if self.verbose:
+                    print("警告: 丢弃检查点落盘失败（%s），下轮可能仍读到旧断点"
+                          % e, file=sys.stderr)
+        self.checkpoint_discarded = True
+        self.finished_bytes = 0
+        if self.verbose and dropped:
+            print("已丢弃失效检查点：作废 %s 进度（源已变更为新内容）"
+                  % _fmt(dropped), file=sys.stderr)
 
     def _bind_resume_to_source(self) -> bool:
         """把断点绑定到内容。返回 True 表示可以按旧偏移续传。
@@ -817,11 +931,15 @@ class Downloader:
             print("警告: 检查点没有内容指纹（旧版 meta）→ 从头下载", file=sys.stderr)
         return False
 
-    @staticmethod
-    def _raise_source_changed(why: str):
+    def _raise_source_changed(self, why: str):
+        # R2-1：先丢弃再报错。原实现只报「断点已作废」却把 meta 原样留在磁盘上，
+        # 于是每重跑一次都捡起同一个作废断点、报同一句话 —— rc 永远 1，
+        # 用户只能 --force-restart 自救，而文案又暗示重跑就行。
+        # 现在两件事一起做：磁盘上是真作废，屏幕上是真话。
+        self._discard_stale_checkpoint()
         # 文案三要素：旧的是什么 → 新的是什么 → 下一步怎么做。
         raise DownloadError(
-            "源已变更（%s），断点已作废；加 --force-restart 可丢弃检查点重下"
+            "源已变更（%s），旧断点已丢弃；重跑同一条命令即可从头下载新内容"
             % why)
 
     def _run_single(self) -> dict:
@@ -1512,7 +1630,13 @@ def main(argv) -> int:
         p = d.progress()
         sys.stdout.write("\n")
         print(f"失败: {e}")
-        if p["done"]:
+        # R2-1：源已变更分支的报错已经把"下一步"说完了（旧断点已丢弃 →
+        # 重跑同一条命令从头下）。这里再补一句「已下 X，重跑同命令可续传」
+        # 就是自相矛盾：那 X 属于新内容时并不存在，属于旧内容时已经作废。
+        if getattr(d, "checkpoint_discarded", False):
+            if p["done"] and getattr(d, "verbose", False):
+                print(f"（作废的 {_fmt(p['done'])} 旧数据不计入新任务）")
+        elif p["done"]:
             print(f"已下 {_fmt(p['done'])}，重跑同命令可续传。")
         return 1
     p = d.progress()
