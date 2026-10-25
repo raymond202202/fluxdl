@@ -87,7 +87,8 @@ class Task:
     _seq = 0
     _synced = True      # P1-B：是否已进过 SSE 版本号（首次推送时强制带全量字段）
 
-    def __init__(self, url, *, referer=None, cookie=None, name=None, concurrency=0):
+    def __init__(self, url, *, referer=None, cookie=None, name=None, concurrency=0,
+                 force_restart=False):
         # 注意：id 分配必须在 TASKS_LOCK 内完成（见 add_task），否则并发 add 会撞 id
         Task._seq += 1
         self.id = Task._seq
@@ -98,6 +99,8 @@ class Task:
             p = os.path.basename(urllib.parse.urlparse(url).path or "")
             self.name = urllib.parse.unquote(p) or url
         self.requested = concurrency
+        # P0-1：面板侧也要能丢弃作废的检查点（源已变更时唯一的安全出路）。
+        self.force_restart = bool(force_restart)
         self.state = "排队"          # 排队/下载中/完成/失败/已取消
         self.dl: fluxdl.Downloader | None = None
         # P3-2：关机时要 join 这个线程，等内核把 .fluxdl 收尾落盘再退
@@ -133,7 +136,7 @@ class Task:
             self.dl = fluxdl.Downloader(
                 self.url, DOWNLOAD_DIR, concurrency=self.requested,
                 referer=self.referer, cookie=self.cookie, override_name=self.name,
-                on_progress=self._on_prog)
+                on_progress=self._on_prog, force_restart=self.force_restart)
 
             res = self.dl.run()
             self.out_path = res["path"]
@@ -385,6 +388,11 @@ def add_task(url, **kw):
     with TASKS_LOCK:
         for t in TASKS.values():
             if t.state in ("排队", "下载中") and _same_target(t, url, kw):
+                # P0-1：force_restart 的语义是「丢掉检查点重下」，
+                # 复用一个正在跑的旧任务会让这个意图静默失效 ——
+                # 用户以为重下了，其实还在按旧断点续传。
+                if kw.get("force_restart"):
+                    continue
                 return t, True
         t = Task(url, **kw)          # 实例化放进锁内，避免 Task._seq 并发撞 id
         TASKS[t.id] = t
@@ -964,7 +972,8 @@ class Handler(BaseHTTPRequestHandler):
             t, reused = add_task(url, referer=data.get("referer") or None,
                                  cookie=data.get("cookie") or None,
                                  name=data.get("name") or None,
-                                 concurrency=conc)
+                                 concurrency=conc,
+                                 force_restart=bool(data.get("force_restart")))
             return self._json({"ok": True, "id": t.id, "reused": reused})
         return self._json({"error": "not found"}, 404)
 

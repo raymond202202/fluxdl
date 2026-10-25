@@ -37,7 +37,8 @@ import urllib.parse
 DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 CHUNK = 256 * 1024
-META_V = 4
+META_V = 5
+SAMPLE = 4096          # P0-1 降级指纹：首 4 KiB 抽样
 MAX_REDIRECT = 6
 
 
@@ -108,8 +109,13 @@ class HttpPool:
                 pass
         self._slots().clear()
 
-    def open(self, url: str, *, method="GET", rng=None, retries=2, follow=True):
-        """返回 (conn, resp, final_url)。会跟随 3xx 并保持 Range 头。"""
+    def open(self, url: str, *, method="GET", rng=None, retries=2, follow=True,
+             extra=None):
+        """返回 (conn, resp, final_url)。会跟随 3xx 并保持 Range 头。
+
+        extra：额外请求头（P0-1 的 If-Range / If-Unmodified-Since 走这里）。
+        重定向时一并带上 —— 换了主机但内容没换是常态，丢掉它等于关掉校验。
+        """
         for hop in range(MAX_REDIRECT + 1):
             p = urllib.parse.urlparse(url)
             target = (p.path or "/") + (("?" + p.query) if p.query else "")
@@ -120,7 +126,8 @@ class HttpPool:
             for attempt in range(retries + 1):
                 conn, _ = self._conn_for(url)
                 try:
-                    conn.request(method, target, headers=self.headers(rng))
+                    conn.request(method, target,
+                                 headers=self.headers(rng, extra=extra))
                     resp = conn.getresponse()
                     break
                 except Exception as e:
@@ -180,10 +187,24 @@ def _filename(url: str, cd: str | None, fallback="download.bin") -> str:
 # ----------------------------------------------------------------------------
 # probe
 # ----------------------------------------------------------------------------
+def _headers_fp(h) -> tuple[str | None, str | None]:
+    """从响应头里取 (etag, last-modified)，空串归一成 None。
+
+    弱验证器（W/"..."）也照收：If-Range 允许弱比较的是 Last-Modified，
+    而 ETag 强弱之分只影响"If-Range 允不允许命中"，不影响"两个 ETag 相不相等"。
+    我们只关心后者（判断内容有没有换），所以不做强弱过滤 —— 有就比。
+    """
+    et = (h.get("ETag") or "").strip() or None
+    lm = (h.get("Last-Modified") or "").strip() or None
+    return et, lm
+
+
 def probe(url: str, *, ua=None, referer=None, cookie=None) -> dict:
     info = {"url": url, "final_url": url, "size": None, "ranges": False,
             "filename": None, "kind": "unknown", "is_hls": False, "status": None,
-            "content_type": None, "error": None, "note": None}
+            "content_type": None, "error": None, "note": None,
+            # P0-1：内容指纹。HEAD 本来就会回这两个头，白拿，不额外发请求。
+            "etag": None, "last_modified": None}
     pool = HttpPool(ua, referer, cookie, timeout=15)
     try:
         conn, r, final = pool.open(url, method="HEAD")
@@ -204,6 +225,7 @@ def probe(url: str, *, ua=None, referer=None, cookie=None) -> dict:
         h = r.headers
         info["content_type"] = h.get("Content-Type")
         info["filename"] = _filename(final, h.get("Content-Disposition"))
+        info["etag"], info["last_modified"] = _headers_fp(h)
         info["ranges"] = (h.get("Accept-Ranges", "") or "").lower() == "bytes"
         cl = h.get("Content-Length")
         if cl and cl.isdigit():
@@ -242,6 +264,9 @@ def probe(url: str, *, ua=None, referer=None, cookie=None) -> dict:
             info["content_type"] = info["content_type"] or r.headers.get("Content-Type")
             info["filename"] = info["filename"] or _filename(
                 final, r.headers.get("Content-Disposition"))
+            e2, lm2 = _headers_fp(r.headers)
+            info["etag"], info["last_modified"] = (info["etag"] or e2,
+                                                   info["last_modified"] or lm2)
             pool.drain(r, 0)
         except Exception as e2:
             info["error"] = f"HTTP {code or '?'} → {type(e2).__name__}: {e2}"
@@ -274,7 +299,86 @@ def _atomic_json(path: str, obj: dict) -> None:
     os.replace(tmp, path)
 
 
+def _sample_sha(fh, pos: int, size: int) -> str | None:
+    """从 pos 起取首 4 KiB 的 sha —— 没有任何指纹可用时的降级判据。
+
+    为什么从第一个已落盘区间开头取样，而不是从文件 0 轴：
+    文件是预分配的，从没下载过的区块是零，拿它算 sha 恒等无意义。
+    """
+    n = min(SAMPLE, max(0, size - pos))
+    if n <= 0:
+        return None
+    try:
+        fh.seek(pos)
+        buf = fh.read(n)
+    except OSError:
+        return None
+    return hashlib.sha256(buf).hexdigest() if buf else None
+
+
+def _probe_sample_sha(url: str, pool, pos: int, size: int) -> str | None:
+    """续传前向服务端重新取 pos 起的首 4 KiB，算同样的抽样 sha。
+
+    只在「既无 ETag 也无 Last-Modified」的源上才走这条路（多一次 Range 请求）。
+    """
+    n = min(SAMPLE, max(0, size - pos))
+    if n <= 0:
+        return None
+    try:
+        conn, r, _ = pool.open(url, rng=(pos, pos + n - 1))
+        if r.status not in (200, 206):
+            pool.drain(r, 0)
+            return None
+        buf = r.read(n)
+        pool.drain(r, 0)
+    except Exception:
+        return None
+    if not buf:
+        return None
+    return hashlib.sha256(buf).hexdigest()
+
+
+def _fp_of(info: dict) -> dict:
+    """从 probe() 结果里抠出可用于「内容是否还是同一份」的指纹。
+
+    HEAD 响应本来就有这些头，纯白拿，不额外发请求。
+    """
+    return {"etag": (info.get("etag") or None),
+            "last_modified": (info.get("last_modified") or None)}
+
+
+def _fp_desc(fp: dict) -> str:
+    """指纹的中文短描述，用于报错文案（要能让人一眼看出是哪个变了）。"""
+    if fp.get("etag"):
+        return "ETag %s" % fp["etag"]
+    if fp.get("last_modified"):
+        return "Last-Modified %s" % fp["last_modified"]
+    if fp.get("head_sha"):
+        return "首 %d B 抽样 sha %s" % (SAMPLE, fp["head_sha"][:12])
+    return "无"
+
+
+def _fp_changed(old: dict, new: dict) -> tuple[bool, str]:
+    """比对两份指纹。返回 (是否变更, 变更描述)。
+
+    判据优先级与续传请求头一致：etag > last_modified > head_sha。
+    只有两边都非空才会判「变」——服务端这轮没给 etag 不该当成换了内容。
+    """
+    for k, label in (("etag", "ETag"), ("last_modified", "Last-Modified"),
+                     ("head_sha", "抽样 sha")):
+        a, b = old.get(k), new.get(k)
+        if a and b and a != b:
+            return True, "%s %s → %s" % (label, a, b)
+    return False, ""
+
+
 def _load_meta(meta_path: str, url: str, size: int | None) -> dict:
+    """读检查点。
+
+    P0-1：v4 的 meta 里只有 url/size/done，**没有内容指纹**，无法证明
+    「磁盘上那半截」和服务端此刻的文件是同一份 —— 拿它续传正是静默混合的成因。
+    所以 v4 一律当「无检查点」处理，并在上层打印一行原因；只有 v5 允许续传。
+    """
     if os.path.exists(meta_path):
         try:
             with open(meta_path, encoding="utf-8") as f:
@@ -314,7 +418,7 @@ def _gaps(meta: dict, size: int) -> list[list[int]]:
 class Downloader:
     def __init__(self, url, out_dir=".", *, concurrency=0, ua=None, referer=None,
                  cookie=None, override_name=None, adaptive=True, on_progress=None,
-                 max_concurrency=16, verbose=False):
+                 max_concurrency=16, verbose=False, force_restart=False):
         self.url, self.out_dir = url, out_dir
         self.verbose = verbose
         self.requested = int(concurrency or 0)
@@ -323,6 +427,11 @@ class Downloader:
         self.ua, self.referer, self.cookie = ua, referer, cookie
         self.override_name, self.adaptive = override_name, adaptive
         self.on_progress = on_progress or (lambda p: None)
+        # P0-1：丢弃检查点重下。源已变更时唯一安全的出路 —— 不能复用旧偏移。
+        self.force_restart = bool(force_restart)
+        self.if_range = None          # 续传时给 worker 用的 If-Range / If-Unmodified-Since
+        self._worker_fp_violation = False   # 有 worker 撞上「源已变更」
+        self.resumed_from_fp = None   # 本次续传基于的旧指纹（诊断/告警用）
 
         self.info, self.total = {}, 0
         self.finished_bytes = self.fetched = 0
@@ -370,8 +479,17 @@ class Downloader:
                 end = a + take - 1
             got = 0
             try:
-                conn, r, _ = self.pool.open(self.url, rng=(a, end))
+                extra = dict([self.if_range]) if self.if_range else None
+                conn, r, _ = self.pool.open(self.url, rng=(a, end), extra=extra)
                 if r.status == 200:
+                    # P0-1：带了 If-Range 却回 200 == 服务端明确表态"内容不是那一份"。
+                    # 这时候写进去的每个字节都会和旧数据错位，必须立刻停手。
+                    if self.if_range:
+                        self._worker_fp_violation = True
+                        raise DownloadError(
+                            "源已变更（%s 不再匹配），断点已作废；"
+                            "加 --force-restart 可丢弃检查点重下"
+                            % self.if_range[1])
                     raise DownloadError("服务端忽略 Range（返回 200），数据会错位")
                 if r.status != 206:
                     raise DownloadError(f"HTTP {r.status}")
@@ -390,6 +508,11 @@ class Downloader:
                         self.fetched += len(buf)
                 self.pool.drain(r)
             except Exception as e:
+                if getattr(self, "_worker_fp_violation", False):
+                    # 源已变更：不回收区间、不再重试，直接把整轮下载判死。
+                    self.error = str(e)
+                    self.stop_flag.set()
+                    return
                 if not self.stop_flag.is_set():
                     self.error = f"段 {a}-{end}: {type(e).__name__}: {e}"
                 with self.lock:
@@ -418,6 +541,13 @@ class Downloader:
         with self.meta_lock:
             for a, b in pend:
                 _merge(self.meta, a, b)
+            # P0-1：指纹随 meta 一起落盘，重跑时才有东西可比。
+            fp = _fp_of(self.info or {})
+            if fp.get("etag"):
+                self.meta["etag"] = fp["etag"]
+            if fp.get("last_modified"):
+                self.meta["last_modified"] = fp["last_modified"]
+            self.meta["v"] = META_V
             # 即使 pend 为空也落盘一次：中断前若无任何完成区间，
             # 也需要 meta 文件存在，重跑时才能识别"这是同一任务的续传"而非全新下载。
             _atomic_json(self.meta_path, self.meta)
@@ -441,7 +571,16 @@ class Downloader:
         span = min(3 * 1024 * 1024, self.total - 1)
         t, got = time.time(), 0
         try:
-            conn, r, _ = self.pool.open(self.url, rng=(0, span))
+            # P0-1：测速也走 Range，所以续传时必须一并带 If-Range。
+            # 这个请求只读不写，不带也不会污染磁盘；但它是"续传期间的 Range 请求"，
+            # 不带就等于放过了一次「源已变更」的免费检测机会，也让
+            # "续传期所有 Range 请求都绑定内容" 这条不变量出现例外（测试会抓）。
+            extra = dict([self.if_range]) if self.if_range else None
+            conn, r, _ = self.pool.open(self.url, rng=(0, span), extra=extra)
+            if r.status == 200 and self.if_range:
+                # 服务端明确表态：内容不是那一份了。别测速了，交给工人路径去报错。
+                self.pool.drain(r)
+                return self.requested or 1
             if r.status != 206:
                 return 1
             while time.time() - t < 1.5:
@@ -483,16 +622,28 @@ class Downloader:
         self.path = os.path.join(self.out_dir, name)
         self.meta_path = self.path + ".fluxdl"
 
-        if not self.info.get("ranges") or not self.total:
-            return self._run_single()
-
+        # P1-1：锁必须提到统一入口。
+        # 原实现只在 ranged 分支加锁，`_run_single`（源不支持 Range：CDN 边缘、
+        # 签名 URL、代理配错）完全裸奔 —— 实测两个进程同下同一输出名：
+        # A 先完成、打印「完成」并 rc=0，B 随后失败却把 A 的成品覆盖成自己的
+        # 残缺内容，还甩一个裸 FileNotFoundError Traceback。
+        # 加锁后这种情况变成明确报错，且「完成」二字一定对应磁盘上真实完整的那份。
         with _FileLock(self.path):
+            if not self.info.get("ranges") or not self.total:
+                return self._run_single()
             return self._run_ranged()
 
     def _run_ranged(self) -> dict:
         """Range 下载主体（已在 _FileLock 保护下）。"""
         had_meta = os.path.exists(self.meta_path)
+        if self.force_restart and (had_meta or os.path.exists(self.path)):
+            self._discard_checkpoint()
+            had_meta = False
         self.meta = _load_meta(self.meta_path, self.final_url, self.total)
+        # P0-1：只有带指纹的 v5 检查点才允许续传。
+        self.meta.setdefault("etag", None)
+        self.meta.setdefault("last_modified", None)
+        self.meta.setdefault("head_sha", None)
         self.finished_bytes = sum(e - s for s, e in self.meta["done"])
         gaps = _gaps(self.meta, self.total)
 
@@ -502,9 +653,21 @@ class Downloader:
         existed_same_size = os.path.exists(self.path) and os.path.getsize(self.path) == self.total
         trusted_resume = had_meta and existed_same_size and bool(self.meta.get("done"))
         if existed_same_size and not trusted_resume:
-            print(f"警告: {self.path} 已存在且大小匹配，但缺少有效续传元数据 "
-                  f"→ 视为未完成，重新下载", file=sys.stderr)
+            # P0-1：把「为什么重下」说清楚。旧版 meta 只有 v4，没有指纹可比，
+            # 静默沿用它就等于把这轮的混合留给下一轮 —— 所以宁可重下。
+            why = ("旧版检查点没有内容指纹（v4 → v5），无法确认服务端文件未变"
+                   if had_meta else "缺少有效续传元数据")
+            print(f"警告: {self.path} 已存在且大小匹配，但{why} "
+                  f"→ 视为未完成，从头下载", file=sys.stderr)
         fresh = not trusted_resume
+
+        if not fresh:
+            # P0-1 核心：动笔之前先证明"服务端此刻的文件 == 磁盘上那半截"。
+            fresh = not self._bind_resume_to_source()
+            if fresh:
+                self.meta["done"] = []
+                self.finished_bytes = 0
+                gaps = _gaps(self.meta, self.total)
 
         fh = open(self.path, "w+b" if fresh else "r+b")
         try:
@@ -512,6 +675,14 @@ class Downloader:
                 fh.truncate(self.total)          # 预分配：避免边写边扩，也让 pwrite 合法
             elif os.path.getsize(self.path) < self.total:
                 fh.truncate(self.total)
+            # P0-1 降级指纹：源既无 ETag 也无 Last-Modified 时，只能拿
+            # 「已下载区间的开头 4 KiB」的 sha 当内容判据。
+            # 续传前重算同一段比对即可，成本一次 Range 请求。
+            if self._needs_head_sha() and not self.meta.get("head_sha"):
+                pos = min((s for s, _e in (self.meta["done"] or gaps)), default=0)
+                _s = _sample_sha(fh, pos, self.total)
+                if _s:
+                    self.meta["head_sha"] = _s
             self.concurrency = self._measure_and_pick()
             self.t0 = time.time()
             if not gaps:
@@ -572,7 +743,86 @@ class Downloader:
             os.remove(self.meta_path)
         self.finished = True
         return {"path": self.path, "kind": "file", "size": self.total,
-                "resumed_from": self.finished_bytes}
+                "resumed_from": self.finished_bytes,
+                "resumed_fp": self.resumed_from_fp}
+
+    def _needs_head_sha(self) -> bool:
+        """本次是否需要写降级指纹：源没给任何验证器，且我们没在用它续传。"""
+        fp = _fp_of(self.info or {})
+        return not fp.get("etag") and not fp.get("last_modified")
+
+    def _discard_checkpoint(self):
+        """--force-restart：删 .fluxdl 与（预分配过的）.part 成品，从零开始。
+
+        只删这两个已知产物，不动目录里别的东西。
+        """
+        removed = []
+        for p in (self.meta_path, self.path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+                    removed.append(os.path.basename(p))
+            except OSError as e:
+                raise DownloadError("--force-restart 无法删除 %s: %s" % (p, e))
+        if self.verbose and removed:
+            print("已丢弃检查点: %s" % ", ".join(removed), file=sys.stderr)
+
+    def _bind_resume_to_source(self) -> bool:
+        """把断点绑定到内容。返回 True 表示可以按旧偏移续传。
+
+        两道闸：
+          1. 续传前 HEAD 的指纹 vs meta 里的指纹，不一致直接判源已变；
+          2. 设好 If-Range，让 worker 的每个 206 请求都带上它 ——
+             万一在我们校验之后源又换了，服务端会回 200，_worker 立刻失败。
+        两道都过不了（既无 etag 也无 last-modified）时降级到首 4 KiB 抽样 sha。
+        """
+        size = self.total
+        old = {"etag": self.meta.get("etag"),
+               "last_modified": self.meta.get("last_modified"),
+               "head_sha": self.meta.get("head_sha")}
+        cur = _fp_of(self.info)
+
+        changed, why = _fp_changed(old, cur)
+        if changed:
+            self._raise_source_changed(why)
+
+        # 服务端这轮带了 etag：用它做 If-Range（最强判据，服务端自己比对）
+        if cur.get("etag"):
+            self.if_range = ("If-Range", cur["etag"])
+            self.resumed_from_fp = cur
+            return True
+        if cur.get("last_modified") and cur["last_modified"] == old.get("last_modified"):
+            self.if_range = ("If-Unmodified-Since", cur["last_modified"])
+            self.resumed_from_fp = cur
+            return True
+
+        # 降级：两端都没有验证器 → 首 4 KiB 抽样比对
+        pos = min((s for s, _e in self.meta["done"]), default=0)
+        if old.get("head_sha") and os.path.exists(self.path):
+            try:
+                with open(self.path, "rb") as fh:
+                    mine = _sample_sha(fh, pos, size)
+            except OSError:
+                mine = None
+            theirs = _probe_sample_sha(self.final_url, self.pool, pos, size)
+            if mine and theirs and mine != theirs:
+                self._raise_source_changed("抽样 sha %s → %s" % (mine, theirs))
+            if mine and theirs:
+                self.resumed_from_fp = {"head_sha": mine}
+                return True
+            if self.verbose:
+                print("警告: 无验证器的源，抽样比对失败 → 从头下载", file=sys.stderr)
+            return False
+        if self.verbose:
+            print("警告: 检查点没有内容指纹（旧版 meta）→ 从头下载", file=sys.stderr)
+        return False
+
+    @staticmethod
+    def _raise_source_changed(why: str):
+        # 文案三要素：旧的是什么 → 新的是什么 → 下一步怎么做。
+        raise DownloadError(
+            "源已变更（%s），断点已作废；加 --force-restart 可丢弃检查点重下"
+            % why)
 
     def _run_single(self) -> dict:
         """无 Range 支持：单连接顺序下载，明确不做续传。"""
@@ -616,7 +866,15 @@ class Downloader:
             raise DownloadError(
                 "响应被截断：Content-Length=%d，实收 %d 字节（差 %d）"
                 % (self.total, n, self.total - n))
-        os.replace(part, self.path)
+        # P1-1：即使有锁，part 也可能被外部因素弄没（用户/杀毒/容器清理）。
+        # 裸 os.replace 抛 FileNotFoundError 会甩出整段 Traceback，
+        # 用户看到的是 Python 栈而不是"出了什么事、该怎么办"。
+        try:
+            os.replace(part, self.path)
+        except OSError as e:
+            raise DownloadError(
+                "无法写入成品 %s（%s）；临时文件 %s 状态异常，重跑同命令会重新下载"
+                % (self.path, e, part)) from e
         self.finished = True
         return {"path": self.path, "kind": "file", "size": n}
 
@@ -666,51 +924,258 @@ def _parse_m3u8(text: str, base: str):
 
 
 def _resolve_segments(url: str, pool: HttpPool, depth=0):
-    conn, r, final = pool.open(url)
-    body = r.read().decode("utf-8", "replace")
-    pool.drain(r)
-    segs, master = _parse_m3u8(body, final)
-    if master and segs and depth < 3:
-        return _resolve_segments(segs[0], pool, depth + 1)
-    return segs
+    """解析出最终的分片列表 + 指纹。返回 (segs, fingerprints, url_of_seg)。
 
-
-def _check_hls_supported(url: str, pool: HttpPool, depth=0) -> None:
-    """沿 master -> media 走一遍，加密流或 fMP4 初始化段直接拒绝。
-
-    宁可明确报"不支持"，也不要合并出一个返回 0 的坏视频。
+    P2-D：原先 `_check_hls_supported()` 和本函数各拉一次 m3u8，master playlist
+    还要再进一层 —— 同一个清单被 GET 3 次（实测 E7b 日志 `['/c.m3u8']*3`）。
+    现在合并成一次下行，解析结果一次算完，顺带把守卫检查也做掉。
+    P0-2：同时算出每个分片的内容指纹（见 `_seg_fingerprint`），供下次复用前比对。
     """
-    conn, r, final = pool.open(url)
-    body = r.read().decode("utf-8", "replace")
-    pool.drain(r, 0)
-    encrypted, maps = _m3u8_guards(body)
-    if encrypted:
+    seen_guard = {"encrypted": [], "maps": []}
+    segs, seg_url = _walk_playlists(url, pool, depth, seen_guard)
+    if seen_guard["encrypted"]:
         raise DownloadError(
             "该 HLS 流已加密（#EXT-X-KEY METHOD=AES-128 等），当前不支持解密")
-    if maps:
+    if seen_guard["maps"]:
         raise DownloadError(
             "该 HLS 流为 fMP4（含 #EXT-X-MAP 初始化段），"
             "直接 concat 会得到无 moov 的坏文件，当前不支持。init: %s"
-            % ", ".join(maps[:3]))
+            % ", ".join(seen_guard["maps"][:3]))
+    return segs, [_seg_fingerprint(u) for u in segs], seg_url
+
+
+def _walk_playlists(url: str, pool: HttpPool, depth, guard: dict):
+    """沿 master -> media 走一遍，边解析边做加密/fMP4 守卫。返回 (segs, 清单最终 URL)。"""
+    conn, r, final = pool.open(url)
+    body = r.read().decode("utf-8", "replace")
+    pool.drain(r)
+    encrypted, maps = _m3u8_guards(body)
+    if encrypted:
+        guard["encrypted"].append(final)
+    guard["maps"].extend(maps)
     segs, master = _parse_m3u8(body, final)
     if master and segs and depth < 3:
-        _check_hls_supported(segs[0], pool, depth + 1)
+        return _walk_playlists(segs[0], pool, depth + 1, guard)
+    return segs, final
+
+
+def _seg_fingerprint(seg_url: str) -> str:
+    """P0-2：分片的内容身份 = sha1(分片 URL) 前 12 位。
+
+    为什么用 URL 而不是下载后算内容 sha1：复用判断发生在**下载之前**，
+    此时手上只有清单。URL 变了（换源/换清晰度/重新切片）就说明这一份不是上一份；
+    URL 没变但内容被换了，由下面 `.manifest` 里的 size 兜底（对不上就作废）。
+    """
+    return hashlib.sha1(seg_url.encode("utf-8")).hexdigest()[:12]
+
+
+SEG_MANIFEST = ".manifest.json"
+SEG_KEEP_SECONDS = 24 * 3600      # P2-E：成功后默认保留 24h，够用户自证，也不会长期占盘
+
+
+def _seg_probe_remote(seg_url: str, pool: HttpPool) -> dict:
+    """P0-2 的内容兜底：HEAD（或 0-0 Range）取分片的 ETag/Last-Modified/长度。
+
+    为什么光有 `sha1(url)` 指纹不够 —— 这是本测试实跑打出来的坑：
+    E7b 现场源站把 `seg0.ts` 的内容换了，**URL 一个字都没变**。
+    只按 URL 算指纹 → 两次清单完全一致 → 判定"可以复用" → 0 个 .ts 请求 →
+    照样混剪。所以必须有一个"服务端亲口说的内容身份"，这里取 ETag，
+    退化到 Last-Modified，再退化到长度。
+    """
+    out = {"etag": None, "last_modified": None, "len": None}
+    try:
+        conn, r, _ = pool.open(seg_url, method="HEAD")
+        try:
+            if 200 <= r.status < 300:
+                out["etag"] = r.headers.get("ETag")
+                out["last_modified"] = r.headers.get("Last-Modified")
+                cl = r.headers.get("Content-Length")
+                if cl and cl.isdigit():
+                    out["len"] = int(cl)
+        finally:
+            pool.drain(r)
+    except Exception:
+        pass
+    if not out["etag"] and not out["last_modified"] and out["len"] is None:
+        # HEAD 不可用（常见于简易服务端 501）→ 用 1 字节 Range 兜底
+        try:
+            conn, r, _ = pool.open(seg_url, rng=(0, 0))
+            try:
+                out["etag"] = r.headers.get("ETag")
+                out["last_modified"] = r.headers.get("Last-Modified")
+                cr = r.headers.get("Content-Range")
+                if cr and "/" in cr:
+                    t = cr.split("/")[-1].strip()
+                    if t.isdigit():
+                        out["len"] = int(t)
+            finally:
+                pool.drain(r)
+        except Exception:
+            pass
+    return out
+
+
+def _content_token(fp_info):
+    """把服务端给的内容身份压成一个可比较的短串。拿不到就返回 None。"""
+    if not fp_info:
+        return None
+    parts = []
+    if fp_info.get("etag"):
+        parts.append("e:" + str(fp_info["etag"]))
+    if fp_info.get("last_modified"):
+        parts.append("m:" + str(fp_info["last_modified"]))
+    if fp_info.get("len") is not None:
+        parts.append("l:" + str(fp_info["len"]))
+    return "|".join(parts) if parts else None
+
+
+def _bind_segments(seg_dir: str, segs, fps, playlist_url: str, *, force_restart=False,
+                   pool=None):
+    """P0-2：开跑前把「本次清单」与「上次留下的分片」对齐，不一致就整目录作废。
+
+    这就是 E5/E7b 的根因所在：原实现只写 `%05d.ts`，靠 `os.path.exists()` 判断
+    "下过了"，源站换了同大小内容也照样跳过 → 0 个 .ts 请求，成品是新旧混剪。
+    现在的判据是：
+      1. 分片名自带 sha1(URL) 指纹（序号相同、URL 不同 → 不同文件，不会误认）；
+      2. 目录里放一份 `.manifest.json` 记录本次的 [idx, fp, url] 与清单地址；
+      3. 清单对不上（数量/顺序/指纹/清单 URL 任一变化）→ 删掉旧分片重下。
+    宁可重下，不可混剪：混剪是 `rc=0 + 校验通过` 的静默错误，代价远高于重下。
+    """
+    man_path = os.path.join(seg_dir, SEG_MANIFEST)
+    # 先看有没有旧清单；只有"可能复用"时才值得去问服务端（省请求）
+    cur = {"playlist": playlist_url,
+           "segs": [{"i": i, "fp": fps[i], "url": u} for i, u in enumerate(segs)]}
+    prev = None
+    if os.path.exists(man_path):
+        try:
+            with open(man_path, encoding="utf-8") as f:
+                prev = json.load(f)
+        except (OSError, ValueError):
+            prev = None
+
+    reuse = False
+    if force_restart:
+        pass                                     # 显式要求重下
+    elif prev is None:
+        # 没有清单但有分片：来路不明（旧版残留 / 手工塞的）。一律作废。
+        stale = [n for n in os.listdir(seg_dir) if n.endswith(".ts")]
+        if stale:
+            print("警告: %s 有 %d 个无清单约束的分片，无法确认是否同一份内容 → 丢弃重下"
+                  % (seg_dir, len(stale)), file=sys.stderr)
+    else:
+        psegs = prev.get("segs") or []
+        if prev.get("playlist") != playlist_url:
+            print("警告: HLS 清单地址已变（%s → %s），旧分片作废"
+                  % (prev.get("playlist"), playlist_url), file=sys.stderr)
+        elif len(psegs) != len(cur["segs"]):
+            print("警告: HLS 分片数变了（%d → %d），旧分片作废"
+                  % (len(psegs), len(cur["segs"])), file=sys.stderr)
+        elif [(x.get("i"), x.get("fp")) for x in psegs] != \
+                [(x["i"], x["fp"]) for x in cur["segs"]]:
+            # 清单结构变了（分片 URL 换了 / 顺序变了）
+            print("警告: HLS 分片清单与上次不一致（源已更换），旧分片作废，全部重下",
+                  file=sys.stderr)
+        else:
+            # 结构一致。但 E7b 现场是"URL 一模一样、内容被换"——
+            # 光比 URL 指纹仍会误判复用，所以还要问服务端要内容身份（ETag/长度）。
+            changed = None
+            if pool is not None:
+                for ps, cs in zip(psegs, cur["segs"]):
+                    tok = _content_token(_seg_probe_remote(cs["url"], pool))
+                    if tok is None:
+                        continue          # 服务端不给任何身份 → 无话可说，保持复用
+                    old_tok = ps.get("ctok")
+                    if old_tok is None:
+                        # 旧清单没记内容身份（首次升级），不能凭"没记录"就复用
+                        changed = "旧清单缺少内容指纹，无法确认分片未变"
+                        break
+                    if old_tok != tok:
+                        changed = "分片 %d 内容已变（%s ≠ %s）" % (cs["i"], old_tok, tok)
+                        break
+            if changed:
+                print("警告: HLS %s → 旧分片作废，全部重下" % changed, file=sys.stderr)
+            else:
+                reuse = True
+
+    if not reuse:
+        for n in os.listdir(seg_dir):
+            if n.endswith(".ts") or n == "concat.txt":
+                try:
+                    os.remove(os.path.join(seg_dir, n))
+                except OSError:
+                    pass
+    # 把内容身份落盘 —— 下次才能比对。
+    # 注意：这里不能只处理"上一次也存在的分片"。首次运行（prev 为 None）时
+    # 若跳过写入，下次就会因为"旧清单缺少内容指纹"而白白重下一遍
+    # （实测就是这个 bug：RUN1 全 None → RUN2 判作废 → 复用形同失效）。
+    if pool is not None:
+        psegs_by_i = {x.get("i"): x for x in ((prev or {}).get("segs") or [])}
+        for cs in cur["segs"]:
+            ps = psegs_by_i.get(cs["i"])
+            if reuse and ps and ps.get("ctok"):
+                cs["ctok"] = ps["ctok"]          # 复用且已核对过，沿用以省请求
+            else:
+                cs["ctok"] = _content_token(_seg_probe_remote(cs["url"], pool))
+    _atomic_json(man_path, cur)
+    return reuse
+
+
+def _mark_segments_done(seg_dir: str, *, keep: bool):
+    """P2-E：成功后不立即销毁证据。
+
+    - `--keep-segments`：原样保留，用户自己清；
+    - 否则打上 `done_at` 时间戳，24h 后（下次成功下载时）再清，
+      这样"面板显示成功但内容是错的"这种事有东西可查。
+    """
+    man_path = os.path.join(seg_dir, SEG_MANIFEST)
+    try:
+        with open(man_path, encoding="utf-8") as f:
+            man = json.load(f)
+    except (OSError, ValueError):
+        man = {}
+    man["done_at"] = time.time()
+    man["kept"] = bool(keep)
+    try:
+        _atomic_json(man_path, man)
+    except OSError:
+        pass
+    if not keep:
+        _gc_segments(seg_dir)
+
+
+def _gc_segments(seg_dir: str):
+    """清掉超过保留期的已完成分片目录内容。"""
+    man_path = os.path.join(seg_dir, SEG_MANIFEST)
+    try:
+        with open(man_path, encoding="utf-8") as f:
+            man = json.load(f)
+    except (OSError, ValueError):
+        return
+    if man.get("kept"):
+        return
+    done_at = man.get("done_at")
+    if not done_at or time.time() - done_at < SEG_KEEP_SECONDS:
+        return
+    shutil.rmtree(seg_dir, ignore_errors=True)
 
 
 def hls_download(url, out_dir, *, name=None, ua=None, referer=None, cookie=None,
-                 concurrency=8, on_progress=None, stop=None) -> str:
+                 concurrency=8, on_progress=None, stop=None,
+                 keep_segments=False, force_restart=False) -> str:
     on_progress = on_progress or (lambda p: None)
     stop = stop or threading.Event()
     os.makedirs(out_dir, exist_ok=True)
     pool = HttpPool(ua, referer, cookie)
-    _check_hls_supported(url, pool)
-    segs = _resolve_segments(url, pool)
+    # P2-D：清单只下一次（守卫 + 分片列表 + 指纹一起出来）
+    segs, fps, playlist_url = _resolve_segments(url, pool)
     if not segs:
         raise DownloadError("m3u8 未解析出任何分片")
 
     stem = os.path.splitext(name or _filename(url, None, "video.mp4"))[0]
     seg_dir = os.path.join(out_dir, f".{stem}.segments")
     os.makedirs(seg_dir, exist_ok=True)
+    _bind_segments(seg_dir, segs, fps, playlist_url,
+                   force_restart=force_restart, pool=pool)
     total = len(segs)
     todo, done_cnt, errs = list(range(total)), 0, []
     lock = threading.Lock()
@@ -724,7 +1189,8 @@ def hls_download(url, out_dir, *, name=None, ua=None, referer=None, cookie=None,
                 if not todo:
                     return
                 i = todo.pop(0)
-            path = os.path.join(seg_dir, f"{i:05d}.ts")
+            # P0-2：分片名带内容指纹，序号相同但来源不同 → 文件名不同，天然不会误复用
+            path = os.path.join(seg_dir, f"{i:05d}-{fps[i]}.ts")
             if os.path.exists(path) and os.path.getsize(path) > 0:
                 with lock:
                     done_cnt += 1
@@ -768,10 +1234,13 @@ def hls_download(url, out_dir, *, name=None, ua=None, referer=None, cookie=None,
     playlist = os.path.join(seg_dir, "concat.txt")
     with open(playlist, "w", encoding="utf-8") as f:
         for i in range(total):
-            f.write(f"file '{i:05d}.ts'\n")
+            f.write(f"file '{i:05d}-{fps[i]}.ts'\n")
     out = os.path.join(out_dir, stem + ".mp4")
     if not shutil.which("ffmpeg"):
-        raise DownloadError("分片已下完，但缺 ffmpeg 无法合并")
+        # P0-2/P3：说清楚这些分片下次还会被用（指纹一致才复用，不一致会重下）
+        raise DownloadError(
+            "分片已下完，但缺 ffmpeg 无法合并；分片保留在 %s，"
+            "装好 ffmpeg 后重跑同命令即可复用（清单未变才会复用）" % seg_dir)
     try:
         # 没有 timeout 时 ffmpeg 一卡住，任务就永久停在"合并中"且不响应取消
         p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -782,7 +1251,9 @@ def hls_download(url, out_dir, *, name=None, ua=None, referer=None, cookie=None,
         raise DownloadError("ffmpeg 合并超时（30 分钟），分片已保留在 %s" % seg_dir)
     if p.returncode != 0:
         raise DownloadError(f"ffmpeg 合并失败: {p.stderr.strip()[:300]}")
-    shutil.rmtree(seg_dir, ignore_errors=True)
+    # P2-E：成功后不再立刻 rmtree —— P0-2 的混剪事故里，这正是唯一物证。
+    # 默认改成「标记完成 + 由下次运行清理」，或用户 --keep-segments 长期保留。
+    _mark_segments_done(seg_dir, keep=keep_segments)
     return out
 
 
@@ -925,15 +1396,28 @@ def verify_file(path: str, *, algo: str = "sha256", expect: str | None = None,
                 return False, ("发现 %d 处空洞，最大一处 偏移 %d–%d（%d 字节）"
                                "（文件很可能是预分配后未写入）"
                                % (len(holes), a, b, b - a))
-            # 稀疏空洞之外，还要查"非稀疏但整段全零"——truncate 预分配后被显式写零，
-            # 或并发写覆盖成零块时，SEEK_HOLE 看不到空洞，但内容同样是坏的。
-            # 只抽 3 个偏移做快速筛查（全量扫描留给摘要比对）。
-            for off in (0, max(0, size // 2 - 4096), max(0, size - 4096)):
-                f.seek(off)
-                blk = f.read(4096)
-                if blk and not any(blk):
-                    return False, ("偏移 %d 处为全零块"
-                                   "（文件很可能是预分配/覆盖后未写入）" % off)
+            # P1-2：这里是原来的第二个判据 —— "抽样块是否全零"，它会误杀合法文件。
+            #
+            # 实测（E2/E2b）：
+            #   8 MiB 全零、非稀疏（_find_holes 返回 []）→ 判"损坏"，可它是合法内容
+            #     （静音音轨 / 全黑片段 / dd if=/dev/zero 的填充镜像都是这样）；
+            #   全零占 99.71% 的文件 → 判"通过"，只因为 4 KiB 抽样窗口恰好落在
+            #     那 0.29% 真实数据上 —— 结论由抽样位置决定，这已经不算判据了。
+            #
+            # 改成：稀疏性优先。`_find_holes()` 有结论（不是 None）就以它为准：
+            # 没有空洞 = 文件被真实写过，不再因"内容恰好全零"判损坏。
+            # 只有在拿不到稀疏信息（tmpfs/网络盘）时才退回抽样，且降级为"提示"。
+            if holes is None:
+                for off in (0, max(0, size // 2 - 4096), max(0, size - 4096)):
+                    f.seek(off)
+                    blk = f.read(4096)
+                    if blk and not any(blk):
+                        # 拿不到稀疏信息时，全零块只提示、不判死
+                        if verbose:
+                            print("[verify] 注意：偏移 %d 处为全零块。本文件系统不支持"
+                                  "空洞检测，无法区分「预分配未写入」与「内容本来就全零」；"
+                                  "传 --expect-sha256 可权威判定" % off, flush=True)
+                        break
     except OSError as e:
         return False, "读取失败: %s" % e
 
@@ -994,6 +1478,9 @@ def main(argv) -> int:
                     help="跳过下载后的内容自检（默认会检测空洞/gzip 魔数）")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="输出诊断信息（如文件系统不支持空洞检测时的降级提示）")
+    ap.add_argument("--force-restart", action="store_true",
+                    help="丢弃已有 .fluxdl 检查点与未完成的 .part，从头下载"
+                         "（源已变更、断点作废时用）")
     a = ap.parse_args(argv)
 
     if a.probe:
@@ -1003,7 +1490,8 @@ def main(argv) -> int:
 
     d = Downloader(a.url, a.out, concurrency=a.concurrency, ua=a.ua,
                    referer=a.referer, cookie=a.cookie, override_name=a.name,
-                   adaptive=not a.no_adaptive)
+                   adaptive=not a.no_adaptive, force_restart=a.force_restart,
+                   verbose=a.verbose)
     last = [0.0]
 
     def on_prog(p):
