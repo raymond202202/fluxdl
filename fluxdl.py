@@ -418,7 +418,8 @@ def _gaps(meta: dict, size: int) -> list[list[int]]:
 class Downloader:
     def __init__(self, url, out_dir=".", *, concurrency=0, ua=None, referer=None,
                  cookie=None, override_name=None, adaptive=True, on_progress=None,
-                 max_concurrency=16, verbose=False, force_restart=False):
+                 max_concurrency=16, verbose=False, force_restart=False,
+                 reuse=True):
         self.url, self.out_dir = url, out_dir
         self.verbose = verbose
         self.requested = int(concurrency or 0)
@@ -429,6 +430,8 @@ class Downloader:
         self.on_progress = on_progress or (lambda p: None)
         # P0-1：丢弃检查点重下。源已变更时唯一安全的出路 —— 不能复用旧偏移。
         self.force_restart = bool(force_restart)
+        # R2-3：HLS 分片默认按清单+本地哈希复用；--no-reuse 时强制全部重下
+        self.reuse = bool(reuse)
         self.if_range = None          # 续传时给 worker 用的 If-Range / If-Unmodified-Since
         self._worker_fp_violation = False   # 有 worker 撞上「源已变更」
         self.resumed_from_fp = None   # 本次续传基于的旧指纹（诊断/告警用）
@@ -662,7 +665,8 @@ class Downloader:
             path = hls_download(self.url, self.out_dir, name=self.override_name,
                                 ua=self.ua, referer=self.referer, cookie=self.cookie,
                                 concurrency=self.concurrency,
-                                on_progress=self.on_progress, stop=self.stop_flag)
+                                on_progress=self.on_progress, stop=self.stop_flag,
+                                reuse=self.reuse)
             self.path, self.finished = path, True
             return {"path": path, "kind": "hls", "size": os.path.getsize(path)}
 
@@ -1203,8 +1207,56 @@ def _seg_probe_remote(seg_url: str, pool: HttpPool) -> dict:
     return out
 
 
-def _content_token(fp_info):
-    """把服务端给的内容身份压成一个可比较的短串。拿不到就返回 None。"""
+# R2-3：本地分片哈希 / 服务端身份缺失提示。
+# 记录"下载完成后"的 sha1，是为了把「本地文件被截断 / 手工替换 / 旧版本残留」
+# 这种纯本地损坏挡住 —— 它不花任何网络请求，也就不会削弱 0 请求续传。
+SEG_HASH_ALGO = "sha1"
+_HASH_MISSING = (None, "", 0)
+
+
+def _seg_hash(path: str) -> str | None:
+    """算本地分片的 sha1；文件不在 / 读不了 → None。"""
+    try:
+        return _hash_file(path, SEG_HASH_ALGO)
+    except OSError:
+        return None
+
+
+def _local_manifest_path(seg_dir: str) -> str:
+    return os.path.join(seg_dir, SEG_MANIFEST)
+
+
+def _forget_manifest(seg_dir: str) -> None:
+    """丢掉本地清单。清单里记着分片哈希，一旦整目录作废就必须一起丢，
+    否则下一轮会拿旧哈希去"校验"刚重下的分片，判成损坏再重下一遍。"""
+    try:
+        os.remove(_local_manifest_path(seg_dir))
+    except OSError:
+        pass
+
+
+def _local_victim(seg_dir: str, idx: int, fp: str, rec: dict, prev_urls: dict) -> str:
+    """该分片的磁盘路径（无论清单里记的 URL 是否还在本次清单里）。
+
+    为什么要用清单里记的 URL 反推文件名：分片 URL 变了 → 文件名里的指纹也变了，
+    按"本次清单"算出来的路径根本不存在，旧文件永远删不掉，还会一路留在目录里。
+    """
+    url = (rec or {}).get("url") or prev_urls.get(idx)
+    name = "%05d-%s.ts" % (idx, _seg_fingerprint(url) if url else fp)
+    return os.path.join(seg_dir, name)
+
+
+# R2-3：长度**不算**内容身份。
+# 这是本轮的实测教训：简易静态服务/S3 风格 CDN 常常只回 Content-Length，
+# 于是 `ctok` 变成 `l:6768`，看起来"有身份"，实际上和"没身份"一样 ——
+# 换掉内容只要长度不变，`l:6768 == l:6768` 照样判复用，警告也永远不会出现。
+# 判断标准改成"服务端有没有亲口说过内容版本"，只有 ETag / Last-Modified 算数。
+def _content_token(fp_info, *, strict=False):
+    """把服务端给的内容身份压成一个可比较的短串。拿不到就返回 None。
+
+    strict=True 时只认 ETag / Last-Modified（长度只作旁证）；
+    strict=False 保留长度（向后兼容旧清单里 `l:` 开头的 ctok）。
+    """
     if not fp_info:
         return None
     parts = []
@@ -1212,9 +1264,14 @@ def _content_token(fp_info):
         parts.append("e:" + str(fp_info["etag"]))
     if fp_info.get("last_modified"):
         parts.append("m:" + str(fp_info["last_modified"]))
-    if fp_info.get("len") is not None:
+    if fp_info.get("len") is not None and not strict:
         parts.append("l:" + str(fp_info["len"]))
     return "|".join(parts) if parts else None
+
+
+def _has_service_identity(fp_info) -> bool:
+    """服务端是否给了可用的内容版本标识（ETag / Last-Modified）。"""
+    return bool(fp_info and (fp_info.get("etag") or fp_info.get("last_modified")))
 
 
 def _bind_segments(seg_dir: str, segs, fps, playlist_url: str, *, force_restart=False,
@@ -1241,6 +1298,23 @@ def _bind_segments(seg_dir: str, segs, fps, playlist_url: str, *, force_restart=
         except (OSError, ValueError):
             prev = None
 
+    seg_paths = lambda idx: os.path.join(               # noqa: E731
+        seg_dir, "%05d-%s.ts" % (idx, fps[idx]))
+    prev_urls = {x.get("i"): x.get("url")
+                 for x in ((prev or {}).get("segs") or []) if isinstance(x, dict)}
+
+    def _drop_all(reason: str) -> bool:
+        """整目录作废：删分片 + 丢清单。返回 False（=不复用）。"""
+        print("警告: HLS %s → 旧分片作废，全部重下" % reason, file=sys.stderr)
+        for n in os.listdir(seg_dir):
+            if n.endswith(".ts") or n == "concat.txt":
+                try:
+                    os.remove(os.path.join(seg_dir, n))
+                except OSError:
+                    pass
+        _forget_manifest(seg_dir)
+        return False
+
     reuse = False
     if force_restart:
         pass                                     # 显式要求重下
@@ -1253,37 +1327,97 @@ def _bind_segments(seg_dir: str, segs, fps, playlist_url: str, *, force_restart=
     else:
         psegs = prev.get("segs") or []
         if prev.get("playlist") != playlist_url:
-            print("警告: HLS 清单地址已变（%s → %s），旧分片作废"
-                  % (prev.get("playlist"), playlist_url), file=sys.stderr)
+            reuse = _drop_all("清单地址已变（%s → %s）"
+                              % (prev.get("playlist"), playlist_url))
         elif len(psegs) != len(cur["segs"]):
-            print("警告: HLS 分片数变了（%d → %d），旧分片作废"
-                  % (len(psegs), len(cur["segs"])), file=sys.stderr)
-        elif [(x.get("i"), x.get("fp")) for x in psegs] != \
-                [(x["i"], x["fp"]) for x in cur["segs"]]:
+            reuse = _drop_all("分片数变了（%d → %d）"
+                              % (len(psegs), len(cur["segs"])))
+        elif [(x.get("i"), x.get("fp")) for x in psegs] !=                 [(x["i"], x["fp"]) for x in cur["segs"]]:
             # 清单结构变了（分片 URL 换了 / 顺序变了）
-            print("警告: HLS 分片清单与上次不一致（源已更换），旧分片作废，全部重下",
-                  file=sys.stderr)
+            reuse = _drop_all("分片清单与上次不一致（源已更换）")
         else:
             # 结构一致。但 E7b 现场是"URL 一模一样、内容被换"——
             # 光比 URL 指纹仍会误判复用，所以还要问服务端要内容身份（ETag/长度）。
+            psegs_by_i = {x.get("i"): x for x in psegs if isinstance(x, dict)}
+            # 先探测全部（服务端身份是唯一能发现"远端换内容"的证据，不能只看第一片）
+            probes = []
+            for cs in cur["segs"]:
+                fp = None
+                if pool is not None:
+                    fp = _seg_probe_remote(cs["url"], pool)
+                # 只认 ETag / Last-Modified；长度见 _content_token 的注释
+                probes.append(_content_token(fp, strict=True))
+            # R2-3：服务端一个内容版本都不给时（只回长度的也算不给），
+            # "旧清单没记 ctok" 不该判作废 —— 那不是"源变了"，而是"根本无从问"。
+            # 这种情形退到「按清单复用 + 本地哈希校验」，并明确警告一次
+            # （见下面 no_service_id 分支）。旧实现漏了这一层：RUN1 记下全 None，
+            # RUN2 判"缺内容指纹" → 全重下，等于把 0 请求续传废掉。
+            no_service_id = all(t is None for t in probes)
             changed = None
-            if pool is not None:
-                for ps, cs in zip(psegs, cur["segs"]):
-                    tok = _content_token(_seg_probe_remote(cs["url"], pool))
-                    if tok is None:
-                        continue          # 服务端不给任何身份 → 无话可说，保持复用
+            if not no_service_id:
+                for cs, tok in zip(cur["segs"], probes):
+                    ps = psegs_by_i.get(cs["i"]) or {}
                     old_tok = ps.get("ctok")
+                    if tok is None:
+                        # 有的片给了身份、这片没给：这一片的远端变化无从判断。
+                        # 不整目录作废（那会退化成全重下），只在下面提醒留个印子。
+                        continue
                     if old_tok is None:
                         # 旧清单没记内容身份（首次升级），不能凭"没记录"就复用
                         changed = "旧清单缺少内容指纹，无法确认分片未变"
-                        break
-                    if old_tok != tok:
+                    elif old_tok != tok:
                         changed = "分片 %d 内容已变（%s ≠ %s）" % (cs["i"], old_tok, tok)
+                    if changed:
                         break
             if changed:
-                print("警告: HLS %s → 旧分片作废，全部重下" % changed, file=sys.stderr)
+                reuse = _drop_all(changed)
             else:
                 reuse = True
+                # R2-3：零请求的本地校验。清单里记着每片"下载完成后"的 sha1，
+                # 对不上（被截断 / 手工替换 / 旧版本残留）就把这一片作废重下。
+                # 只信本地磁盘，不额外发请求 —— 0 请求续传不受影响。
+                bad, no_hash = [], []
+                for cs in cur["segs"]:
+                    ps = psegs_by_i.get(cs["i"]) or {}
+                    p = seg_paths(cs["i"])
+                    if not os.path.exists(p):
+                        continue            # 本来就要下，无需"发现损坏"
+                    if os.path.getsize(p) == 0:
+                        bad.append((cs["i"], "文件为空"))
+                        continue
+                    want = ps.get("sha1")
+                    if want in _HASH_MISSING:
+                        # 旧清单（升级前）没记哈希，本地无从校验 —— 不因此废掉分片，
+                        # 但必须补记，否则下次还是校验不了。
+                        no_hash.append(cs["i"])
+                        continue
+                    got = _seg_hash(p)
+                    if got != want:
+                        bad.append((cs["i"], "sha1 不符（清单 %s… 实际 %s…）"
+                                    % (str(want)[:8], str(got)[:8] if got else "读不出")))
+                if no_hash:
+                    print("警告: HLS 有 %d/%d 个分片缺失本地哈希（旧清单或升级前留下），"
+                          "本轮无法校验其完整性，已补记；下次起可校验"
+                          % (len(no_hash), len(cur["segs"])), file=sys.stderr)
+                if bad:
+                    print("警告: HLS 本地分片校验失败 %d/%d（例: %s）→ 作废重下"
+                          % (len(bad), len(cur["segs"]),
+                             "; ".join("分片 %d %s" % b for b in bad[:3])),
+                          file=sys.stderr)
+                    for idx, _why in bad:
+                        for p in {seg_paths(idx),
+                                  _local_victim(seg_dir, idx, fps[idx],
+                                                psegs_by_i.get(idx) or {}, prev_urls)}:
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+                if no_service_id:
+                    # 只说一次。别把"按清单复用"说成"内容已确认未变" ——
+                    # 服务端换内容又恰好保持长度时，本地无从发现（见 README 限制）。
+                    print("警告: 服务端未提供 ETag/Last-Modified，无法确认分片未变，"
+                          "已按清单复用（本地完整性已校验；如需强制重下请加 --no-reuse）",
+                          file=sys.stderr)
 
     if not reuse:
         for n in os.listdir(seg_dir):
@@ -1297,15 +1431,64 @@ def _bind_segments(seg_dir: str, segs, fps, playlist_url: str, *, force_restart=
     # 若跳过写入，下次就会因为"旧清单缺少内容指纹"而白白重下一遍
     # （实测就是这个 bug：RUN1 全 None → RUN2 判作废 → 复用形同失效）。
     if pool is not None:
-        psegs_by_i = {x.get("i"): x for x in ((prev or {}).get("segs") or [])}
+        psegs_by_i = {x.get("i"): x for x in ((prev or {}).get("segs") or [])
+                      if isinstance(x, dict)}
         for cs in cur["segs"]:
-            ps = psegs_by_i.get(cs["i"])
-            if reuse and ps and ps.get("ctok"):
+            ps = psegs_by_i.get(cs["i"]) or {}
+            if reuse and ps.get("ctok"):
                 cs["ctok"] = ps["ctok"]          # 复用且已核对过，沿用以省请求
             else:
-                cs["ctok"] = _content_token(_seg_probe_remote(cs["url"], pool))
+                cs["ctok"] = _content_token(_seg_probe_remote(cs["url"], pool),
+                                            strict=True)
+    # R2-3：分片哈希在下载完成后（_mark_segment_hashes）才写进去；
+    # 复用的分片沿用清单里已核过的哈希，不能在这里写成 None ——
+    # 那等于把上一轮的校验凭据抹掉，下次又变回"无从校验"。
+    if reuse and prev is not None:
+        psegs_by_i = {x.get("i"): x for x in (prev.get("segs") or [])
+                      if isinstance(x, dict)}
+        for cs in cur["segs"]:
+            h = (psegs_by_i.get(cs["i"]) or {}).get("sha1")
+            if h not in _HASH_MISSING:
+                cs["sha1"] = h
     _atomic_json(man_path, cur)
     return reuse
+
+
+def _mark_segment_hashes(seg_dir: str, segs, fps) -> None:
+    """R2-3：分片真正下载完成（或确认已在盘上）后再算 sha1 落进清单。
+
+    为什么必须放在下载之后而不是下载之前：下载前文件还不存在，算不出东西；
+    而"上一轮留下的分片"已经在 `_bind_segments` 里校验过了（或刚删掉重下），
+    所以这里统一重算一遍，既覆盖新下的片，也顺手给升级前的旧清单补记哈希。
+    """
+    man_path = os.path.join(seg_dir, SEG_MANIFEST)
+    try:
+        with open(man_path, encoding="utf-8") as f:
+            man = json.load(f)
+    except (OSError, ValueError):
+        return
+    recs = {x.get("i"): x for x in (man.get("segs") or []) if isinstance(x, dict)}
+    dirty = False
+    for i, u in enumerate(segs):
+        p = os.path.join(seg_dir, "%05d-%s.ts" % (i, fps[i]))
+        if not os.path.exists(p) or os.path.getsize(p) == 0:
+            continue                     # 没下成 / 空文件：不记哈希，下次照常重下
+        h = _seg_hash(p)
+        if h is None:
+            continue
+        rec = recs.get(i)
+        if rec is None:
+            rec = {"i": i, "fp": fps[i], "url": u}
+            man.setdefault("segs", []).append(rec)
+            recs[i] = rec
+        if rec.get("sha1") != h:
+            rec["sha1"] = h
+            dirty = True
+    if dirty:
+        try:
+            _atomic_json(man_path, man)
+        except OSError:
+            pass
 
 
 def _mark_segments_done(seg_dir: str, *, keep: bool):
@@ -1349,7 +1532,7 @@ def _gc_segments(seg_dir: str):
 
 def hls_download(url, out_dir, *, name=None, ua=None, referer=None, cookie=None,
                  concurrency=8, on_progress=None, stop=None,
-                 keep_segments=False, force_restart=False) -> str:
+                 keep_segments=False, force_restart=False, reuse=True) -> str:
     on_progress = on_progress or (lambda p: None)
     stop = stop or threading.Event()
     os.makedirs(out_dir, exist_ok=True)
@@ -1362,8 +1545,11 @@ def hls_download(url, out_dir, *, name=None, ua=None, referer=None, cookie=None,
     stem = os.path.splitext(name or _filename(url, None, "video.mp4"))[0]
     seg_dir = os.path.join(out_dir, f".{stem}.segments")
     os.makedirs(seg_dir, exist_ok=True)
+    # R2-3：reuse=False（--no-reuse）等价于"这一轮不许复用任何旧片"。
+    # 注意不能简单加个 else 分支就完事 —— 传给 _bind_segments 的 force_restart
+    # 会顺带把整个清单丢掉，这里正是想要的语义：不复用，就从干净状态开始。
     _bind_segments(seg_dir, segs, fps, playlist_url,
-                   force_restart=force_restart, pool=pool)
+                   force_restart=(force_restart or not reuse), pool=pool)
     total = len(segs)
     todo, done_cnt, errs = list(range(total)), 0, []
     lock = threading.Lock()
@@ -1418,6 +1604,9 @@ def hls_download(url, out_dir, *, name=None, ua=None, referer=None, cookie=None,
         raise DownloadError("已取消（分片保留，重跑续传）")
     if errs:
         raise DownloadError(f"{len(errs)} 个分片失败: {sorted(errs)[:5]}（分片已保留）")
+
+    # R2-3：分片齐了才记账 —— 记的是"下载完成后"的 sha1，供下次复用前校验本地完整性。
+    _mark_segment_hashes(seg_dir, segs, fps)
 
     playlist = os.path.join(seg_dir, "concat.txt")
     with open(playlist, "w", encoding="utf-8") as f:
@@ -1669,6 +1858,10 @@ def main(argv) -> int:
     ap.add_argument("--force-restart", action="store_true",
                     help="丢弃已有 .fluxdl 检查点与未完成的 .part，从头下载"
                          "（源已变更、断点作废时用）")
+    ap.add_argument("--no-reuse", action="store_true",
+                    help="HLS：不复用任何已下载分片，全部重下。"
+                         "服务端不给 ETag/Last-Modified、又怀疑分片被换过时用"
+                         "（否则可能按清单复用旧片，见 README「已知限制」）")
     a = ap.parse_args(argv)
 
     if a.probe:
@@ -1679,7 +1872,7 @@ def main(argv) -> int:
     d = Downloader(a.url, a.out, concurrency=a.concurrency, ua=a.ua,
                    referer=a.referer, cookie=a.cookie, override_name=a.name,
                    adaptive=not a.no_adaptive, force_restart=a.force_restart,
-                   verbose=a.verbose)
+                   verbose=a.verbose, reuse=not a.no_reuse)
     last = [0.0]
 
     def on_prog(p):
