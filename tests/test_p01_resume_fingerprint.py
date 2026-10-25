@@ -57,6 +57,13 @@ class _EtagSource:
 
     def __init__(self):
         self.etag = '"%d-1-aaaa"' % len(self.payload)
+        # R2-2：在途请求计数（见 _interrupted_session 的说明）。
+        # 被 SIGTERM 的进程杀掉之后，服务端可能仍在往那个已死的 socket 里写
+        # 当前这一块（每 256 KiB 要写 4 次、每次 sleep 20ms，最长 80ms）。
+        # 这期间它发出的请求同样是「无 If-Range」的续传前请求，若不清干净就会
+        # 混进续传阶段的日志，让"续传请求都带 If-Range"这条断言假红。
+        self.inflight = 0
+        self._inflight_lock = threading.Lock()
 
     def set_payload(self, data: bytes, etag: str):
         self.payload, self.etag = data, etag
@@ -74,6 +81,15 @@ def _make_handler(src: _EtagSource):
             self._serve(head=False)
 
         def _serve(self, head):
+            with src._inflight_lock:
+                src.inflight += 1
+            try:
+                self._serve_body(head)
+            finally:
+                with src._inflight_lock:
+                    src.inflight -= 1
+
+        def _serve_body(self, head):
             rng = self.headers.get("Range")
             ir = self.headers.get("If-Range")
             total = len(src.payload)
@@ -168,6 +184,18 @@ class _ResumeBase(unittest.TestCase):
             p.terminate()
             p.wait(timeout=10)
             self.assertEqual(p.returncode, -15, "应被 SIGTERM 打断")
+            # R2-2：等旧进程的在途请求真正结束再清日志。
+            # 进程被 SIGTERM 后，服务端可能还在往死掉的 socket 里写当前块
+            # （最长约 80ms：256 KiB / 64 KiB × 20ms）。那条请求同样是
+            # 「续传前、无 If-Range」的正常请求，却会在清 log 之后才 append，
+            # 进而污染 test_A 的「续传请求都带 If-Range」断言 —— 实测 3/3 假红。
+            # 等在途归零是确定性写法，不是 sleep 猜时间。
+            wait_until = time.time() + 5
+            while time.time() < wait_until:
+                with self.src._inflight_lock:
+                    if self.src.inflight == 0:
+                        break
+                time.sleep(0.01)
             # 同一个 URL 上换内容（E4 现场：大小一模一样、字节全不同）
             if plant_b:
                 self.src.set_payload(SOURCE_B, ETAG_B)
@@ -203,11 +231,23 @@ class TestResumeBoundToContent(_ResumeBase):
             rc = fluxdl.main([base + "/blob.bin", "-o", self.td, "-c", "1"])
         out = os.path.join(self.td, "blob.bin")
         self.assertNotEqual(rc, 0, "源已变更必须非 0 退出")
-        # 注意：blob.bin 在预分配阶段就存在（大小 == total 但含空洞），
-        # 所以「成品不存在」是错的断言。真正判据是：残件不得通过校验。
-        if os.path.exists(out):
-            ok, why = fluxdl.verify_file(out)
-            self.assertFalse(ok, "源已变更时磁盘文件不得通过校验（否则就是新旧混合）；"
+        # R2-2 更新（收紧，不是削弱）：
+        # 原注释说「blob.bin 在预分配阶段就存在（大小 == total 但含空洞），
+        # 所以『成品不存在』是错的断言」—— 那是 R2-2 之前的事实。现在下载正文
+        # 只写 blob.bin.part，成品名由 os.replace 原子产生，于是最强的断言
+        # 恰好也成了最容易写的那条：**成品名根本不该存在**。
+        # 这里用断言而不是继续 `if os.path.exists(out):` —— 后者在文件不存在时
+        # 整块跳过，R2-2 之后它永远不执行，等于把一条断言悄悄变成空语句。
+        self.assertFalse(os.path.exists(out),
+                         "源已变更时成品名不得存在（半成品应留在 .part）；"
+                         "实际文件大小 %r" % (
+                             os.path.getsize(out) if os.path.exists(out) else None,))
+        # 保留原来那条"残件不得通过校验"的判据，只是把对象换成 .part：
+        # 它校验的是内容，成品名不存在时它无从下手，而 .part 正是残件的落点。
+        part = out + ".part"
+        if os.path.exists(part):
+            ok, why = fluxdl.verify_file(part)
+            self.assertFalse(ok, "源已变更时残件不得通过校验（否则就是新旧混合）；"
                                  "verify_file 却返回通过: %r" % (why,))
         # 文案三要素：判定 + 新旧指纹 + 下一步
         msg = err.getvalue()

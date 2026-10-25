@@ -449,6 +449,9 @@ class Downloader:
         self.stop_flag = threading.Event()
         self.t0 = 0.0
         self.path = self.meta_path = ""
+        # R2-2：下载中的临时文件（成品名 + .part）。
+        # 未完成的下载只允许以这个名字留在输出目录里，成品名永远只出现校验通过的内容。
+        self.part_path = ""
         self.meta = {}
         self.error = None
         self.short_reads = []        # P2-9：短读诊断，最多留 8 条
@@ -668,6 +671,14 @@ class Downloader:
         os.makedirs(self.out_dir, exist_ok=True)
         self.path = os.path.join(self.out_dir, name)
         self.meta_path = self.path + ".fluxdl"
+        # R2-2（方案 A）：正文一律先写进 self.part_path，校验通过后 os.replace 成 self.path。
+        # 为什么不再用「预分配 + 退出路径负责改名」：那种写法的正确性依赖
+        # 「所有 rc≠0 的退出路径都记得收拾」，而退出路径会随功能增加而增多
+        # （源已变更、短读、锁冲突、Ctrl-C、校验失败、未捕获异常…），漏一条就
+        # 安静地留下一个「名字和大小都像成品」的文件 —— 外部脚本 test -f 就当真。
+        # 反过来，让「写入目标」本身就不是成品名之后，遗漏只会留下 .part，
+        # 而成品名**在结构上**只可能由唯一一处 os.replace 产生。
+        self.part_path = self.path + ".part"
 
         # P1-1：锁必须提到统一入口。
         # 原实现只在 ranged 分支加锁，`_run_single`（源不支持 Range：CDN 边缘、
@@ -675,17 +686,25 @@ class Downloader:
         # A 先完成、打印「完成」并 rc=0，B 随后失败却把 A 的成品覆盖成自己的
         # 残缺内容，还甩一个裸 FileNotFoundError Traceback。
         # 加锁后这种情况变成明确报错，且「完成」二字一定对应磁盘上真实完整的那份。
+        # R2-2：锁仍然锁 self.path（成品名，不是 .part）—— 锁的论题是「谁在产出这个名字」，
+        # 而不是「谁在写哪个文件」；两个进程若各锁自己的 .part 就等于没锁。
         with _FileLock(self.path):
             if not self.info.get("ranges") or not self.total:
                 return self._run_single()
             return self._run_ranged()
 
     def _run_ranged(self) -> dict:
-        """Range 下载主体（已在 _FileLock 保护下）。"""
+        """Range 下载主体（已在 _FileLock 保护下）。
+
+        R2-2（方案 A）：本函数只碰 self.part_path；self.path（成品名）
+        在本轮成功之前既不读也不写，只在最后一步由 os.replace 原子产生。
+        """
         had_meta = os.path.exists(self.meta_path)
-        if self.force_restart and (had_meta or os.path.exists(self.path)):
+        if self.force_restart and (had_meta or os.path.exists(self.path)
+                                   or os.path.exists(self.part_path)):
             self._discard_checkpoint()
             had_meta = False
+        self._drop_legacy_pseudo_product()
         self.meta = _load_meta(self.meta_path, self.final_url, self.total)
         # P0-1：只有带指纹的 v5 检查点才允许续传。
         self.meta.setdefault("etag", None)
@@ -697,7 +716,10 @@ class Downloader:
         # 关键修复：预分配会让文件"大小 == total"但内容是空洞。
         # 因此只有「meta 存在且校验通过」时，才可以信任既有文件续传；
         # 否则一律重新预分配（truncate 会把空洞显式归零，避免把垃圾当成品）。
-        existed_same_size = os.path.exists(self.path) and os.path.getsize(self.path) == self.total
+        # R2-2：判据对象从 self.path 换成 self.part_path —— 成品名现在不再
+        # 承载"下载中的半成品"，续传的落点就是 .part。
+        existed_same_size = (os.path.exists(self.part_path)
+                             and os.path.getsize(self.part_path) == self.total)
         trusted_resume = had_meta and existed_same_size and bool(self.meta.get("done"))
         if existed_same_size and not trusted_resume:
             # P0-1：把「为什么重下」说清楚。旧版 meta 只有 v4，没有指纹可比，
@@ -713,7 +735,7 @@ class Downloader:
                 why = "旧版检查点没有内容指纹（v4 → v5），无法确认服务端文件未变"
             else:
                 why = "缺少有效续传元数据"
-            print(f"警告: {self.path} 已存在且大小匹配，但{why} "
+            print(f"警告: {self.part_path} 已存在且大小匹配，但{why} "
                   f"→ 视为未完成，从头下载", file=sys.stderr)
         fresh = not trusted_resume
 
@@ -725,11 +747,12 @@ class Downloader:
                 self.finished_bytes = 0
                 gaps = _gaps(self.meta, self.total)
 
-        fh = open(self.path, "w+b" if fresh else "r+b")
+        # R2-2：读写对象是 .part，不是成品名。
+        fh = open(self.part_path, "w+b" if fresh else "r+b")
         try:
             if fresh:
                 fh.truncate(self.total)          # 预分配：避免边写边扩，也让 pwrite 合法
-            elif os.path.getsize(self.path) < self.total:
+            elif os.path.getsize(self.part_path) < self.total:
                 fh.truncate(self.total)
             # P0-1 降级指纹：源既无 ETag 也无 Last-Modified 时，只能拿
             # 「已下载区间的开头 4 KiB」的 sha 当内容判据。
@@ -800,6 +823,16 @@ class Downloader:
             raise DownloadError(
                 "仍有 %d 个区间未完成: %s%s%s；重跑同命令可续传"
                 % (len(gaps), head, more, diag))
+        # R2-2：这里是成品名的**唯一**产生点 —— 所有区间都已落盘之后。
+        # os.replace 在同一文件系统内是原子的：外部脚本要么看不到 blob.bin，
+        # 要么看到一个完整文件，不存在"存在但只有一半"的中间态。
+        try:
+            os.replace(self.part_path, self.path)
+        except OSError as e:
+            # 不把 .part 删除：它是唯一一份真实数据，删掉等于让用户从头再下。
+            raise DownloadError(
+                "无法把临时文件 %s 改名为成品 %s（%s）；临时文件已保留，重跑同命令可续传"
+                % (self.part_path, self.path, e)) from e
         if os.path.exists(self.meta_path):
             os.remove(self.meta_path)
         self.finished = True
@@ -813,12 +846,14 @@ class Downloader:
         return not fp.get("etag") and not fp.get("last_modified")
 
     def _discard_checkpoint(self):
-        """--force-restart：删 .fluxdl 与（预分配过的）.part 成品，从零开始。
+        """--force-restart：删 .fluxdl、成品名与未完成的 .part，从零开始。
 
-        只删这两个已知产物，不动目录里别的东西。
+        只删这三个已知产物，不动目录里别的东西。
+        R2-2：成品名也要删 —— 切换 .part 之后，成品名只可能来自「校验通过的成品」，
+        如果它真存在，说明这次 --force-restart 是要覆盖一份旧成品（用户的明确意图）。
         """
         removed = []
-        for p in (self.meta_path, self.path):
+        for p in (self.meta_path, self.path, self.part_path):
             try:
                 if p and os.path.exists(p):
                     os.remove(p)
@@ -827,6 +862,40 @@ class Downloader:
                 raise DownloadError("--force-restart 无法删除 %s: %s" % (p, e))
         if self.verbose and removed:
             print("已丢弃检查点: %s" % ", ".join(removed), file=sys.stderr)
+
+    def _drop_legacy_pseudo_product(self):
+        """清掉旧版本（预分配写法）留在成品名上的半成品（R2-2）。
+
+        为什么需要它：R2-2 之前，下载正文直接写进 self.path，于是中断/失败会
+        留下「成品名 + 最终大小 + 内容一半是零」的文件。升级到 .part 写法之后，
+        如果不管它，续传会去读 .part（不存在）→ 从零重下；而那份旧的伪成品会
+        一直挂在成品名上，被外部脚本当成品用 —— 这正是本轮要根除的东西。
+
+        判据只认「无法自证是成品」的情形：
+          - meta 声称有已完成区间，且磁盘上那份与声明大小一致 → 数据可能仍有效，
+            保留不动（续传会去读 .part，读不到就重下，但绝不删用户可能还需要的数据）；
+            实际上这种组合在 .part 写法下已不可能，这里只是保守兜底。
+          - 其余情况（无 meta，或文件大小 ≠ 声明大小）：删掉。
+        宁可删掉重下，也不留一个"看着像成品"的残缺文件。
+        """
+        if not (self.path and os.path.exists(self.path)):
+            return
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return
+        if size == self.total and self.meta.get("done"):
+            return
+        try:
+            os.remove(self.path)
+        except OSError as e:
+            if self.verbose:
+                print("警告: 无法清理旧的半成品 %s（%s）；它可能被当成成品，"
+                      "建议手动删除" % (self.path, e), file=sys.stderr)
+            return
+        if self.verbose:
+            print("已清理上一版留下的半成品: %s（不是成品）"
+                  % os.path.basename(self.path), file=sys.stderr)
 
     def _if_range_enabled(self) -> bool:
         """R2-1：本轮是否还允许带 If-Range。
@@ -912,9 +981,10 @@ class Downloader:
 
         # 降级：两端都没有验证器 → 首 4 KiB 抽样比对
         pos = min((s for s, _e in self.meta["done"]), default=0)
-        if old.get("head_sha") and os.path.exists(self.path):
+        # R2-2：抽样比对的读取对象是 .part —— 半成品只住在那里。
+        if old.get("head_sha") and os.path.exists(self.part_path):
             try:
-                with open(self.path, "rb") as fh:
+                with open(self.part_path, "rb") as fh:
                     mine = _sample_sha(fh, pos, size)
             except OSError:
                 mine = None
